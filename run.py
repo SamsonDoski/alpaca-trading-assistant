@@ -234,11 +234,28 @@ async def cmd_propose(args) -> int:
                   + (f" -- {verdict.reason}" if verdict.reason else ""))
         print()
 
-    if outcome.approved:
-        print(f"  APPROVED: {outcome.draft}")
-        print(f"  (nothing was ordered -- the executor is not built yet)")
-    else:
+    if not outcome.approved:
         print(f"  NO TRADE -- {outcome.reason}")
+        return 0
+
+    print(f"  APPROVED: {outcome.draft}")
+
+    if not args.execute:
+        print("  (not submitted -- pass --execute to send it)")
+        return 0
+
+    from agent.executor import CliExecutor, ExecutionError
+
+    executor = CliExecutor(dry_run=not args.live)
+    try:
+        receipt = executor.buy_to_open(outcome.draft)
+    except ExecutionError as exc:
+        print(f"\n  ORDER FAILED -- {exc}")
+        return 1
+
+    print(f"\n  {receipt}")
+    if receipt.dry_run:
+        print("  (validated by Alpaca but not placed -- pass --live to place it)")
     return 0
 
 
@@ -275,6 +292,10 @@ def main() -> int:
                          help="print exactly what the model was shown")
     propose.add_argument("--ignore-clock", action="store_true",
                          help="run the market-open gate as if the market were open")
+    propose.add_argument("--execute", action="store_true",
+                         help="submit an approved draft (validated only, unless --live)")
+    propose.add_argument("--live", action="store_true",
+                         help="with --execute, actually place the order")
     propose.set_defaults(func=cmd_propose)
 
     raw = sub.add_parser("raw", help="call any read tool and dump its JSON")
