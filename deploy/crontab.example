@@ -27,6 +27,10 @@
 # a rehearsal and a competition entry, which is why it lives here in plain
 # sight rather than in a config file.
 
+# Pins the hours below to UTC no matter what the server's clock is set to.
+# Without this they mean local time, and a schedule that runs at the wrong hour
+# looks exactly like a schedule that runs.
+CRON_TZ=UTC
 PATH=/usr/local/bin:/usr/bin:/bin
 SHELL=/bin/bash
 

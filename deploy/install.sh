@@ -79,14 +79,30 @@ say "6. Tests"
 ./.venv/bin/python -m pytest -q 2>&1 | tail -3 || fail "the test suite does not pass"
 
 say "7. Scheduling every 15 minutes, weekdays, 13:00-20:59 UTC"
+echo "    server clock: $(date)"
+echo "    UTC:          $(date -u)"
+
 LINE="*/15 13-20 * * 1-5 ${PROJECT_DIR}/deploy/run_pass.sh${LIVE_FLAG}"
 chmod +x "${PROJECT_DIR}/deploy/run_pass.sh"
 
-# Replace any previous entry for this project rather than stacking a second
-# one. Two crontab lines for the same agent means two passes racing for the
-# same lock, which works, but only by accident.
-( crontab -l 2>/dev/null | grep -v "${PROJECT_DIR}/deploy/run_pass.sh" ; echo "$LINE" ) | crontab -
+# CRON_TZ pins the schedule to UTC regardless of what the server's clock is set
+# to. Without it the hours below mean local time, so the same crontab traded the
+# right window on a UTC box and the wrong one everywhere else -- and nothing
+# would report the mistake, because a job that runs at the wrong hour looks
+# exactly like a job that runs.
+#
+# Any previous entry for this project is replaced rather than stacked. Two lines
+# for the same agent means two passes racing for the same lock, which works, but
+# only by accident.
+(
+    crontab -l 2>/dev/null \
+        | grep -v "${PROJECT_DIR}/deploy/run_pass.sh" \
+        | grep -v "^CRON_TZ="
+    echo "CRON_TZ=UTC"
+    echo "$LINE"
+) | crontab -
 crontab -l | grep -F "run_pass.sh" || fail "the crontab entry did not take"
+crontab -l | grep -q "^CRON_TZ=UTC" || echo "    warning: CRON_TZ did not stick; check that the server clock is UTC"
 
 say "Done."
 if [[ -n "$LIVE_FLAG" ]]; then
