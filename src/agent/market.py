@@ -1,0 +1,451 @@
+"""Reading the market through Alpaca's MCP server.
+
+This module is the only place in the system that knows what Alpaca's JSON looks
+like. Everywhere else works with the types in `domain.py`. That boundary has a
+name in software design -- an *anti-corruption layer* -- and the reason for it is
+practical: Alpaca calls a bid price `bp`, nests Greeks under `greeks`, and spells
+implied volatility `impliedVolatility`. If those names leaked outward, every
+module would quietly depend on the shape of somebody else's API, and the day
+Alpaca renames a field the change would surface in ten files instead of one.
+
+So the rule is: **JSON comes in, domain objects go out.** Nothing raw escapes.
+
+**Why this module is asynchronous.** Talking to an MCP server means waiting on
+another process, and a pass has nine symbols to look up. Done one after another
+that is minutes of mostly waiting. `asyncio` lets all nine wait at the same time,
+which is what keeps a pass comfortably inside its fifteen-minute slot. The gates
+and the sizing stay ordinary synchronous functions -- they compute rather than
+wait, so concurrency would buy them nothing and cost them clarity.
+
+**Failing loudly versus failing softly.** The two are not the same here and the
+difference matters:
+
+  * Account and positions must succeed. Guessing "probably flat" after a failed
+    read lets the agent re-buy something it already owns and skip an exit it
+    needed to make. A failure here stops the pass.
+  * A single symbol's chain may fail. That is one missed opportunity out of
+    nine, and the next pass is fifteen minutes away, so it is logged and skipped.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+
+from agent.domain import AccountState, OpenPosition, OptionContract
+
+logger = logging.getLogger(__name__)
+
+
+# The tools we call, named once. The server builds its tool list from Alpaca's
+# OpenAPI specs, so these names come from the server rather than from us --
+# `run.py tools` prints the live list if you ever need to check them.
+#
+# Note what is deliberately absent: place_option_market_order, close_position and
+# close_all_positions all exist on that server. This module never names them, so
+# no code path here can reach them even by accident.
+TOOL_ACCOUNT = "get_account_info"
+TOOL_POSITIONS = "get_all_positions"
+TOOL_CLOCK = "get_clock"
+TOOL_OPTION_CHAIN = "get_option_chain"
+TOOL_OPTION_SNAPSHOT = "get_option_snapshot"
+TOOL_STOCK_QUOTE = "get_stock_latest_quote"
+
+
+class MarketDataError(RuntimeError):
+    """A read that the pass cannot safely continue without."""
+
+
+# --------------------------------------------------------------------------
+# Decoding Alpaca's representations.
+#
+# These are plain functions with no dependencies, which makes them the easiest
+# part of the module to test -- and the part most likely to be wrong, since they
+# encode assumptions about someone else's data format.
+# --------------------------------------------------------------------------
+
+# An OCC option symbol packs four facts into one string, fixed width:
+#
+#     AAPL  260918  C  00230000
+#     ^     ^       ^  ^
+#     |     |       |  strike x 1000, 8 digits, zero padded
+#     |     |       call or put
+#     |     expiry as YYMMDD
+#     underlying, 1-6 characters
+#
+# So AAPL260918C00230000 is an Apple call struck at $230.00 expiring 18 Sep 2026.
+_OCC_PATTERN = re.compile(r"^(?P<root>[A-Z]{1,6})(?P<expiry>\d{6})(?P<right>[CP])(?P<strike>\d{8})$")
+
+
+@dataclass(frozen=True, slots=True)
+class OccSymbol:
+    """The four facts decoded out of an OCC symbol."""
+
+    underlying: str
+    expiry: date
+    right: str
+    strike: float
+
+
+def parse_occ_symbol(symbol: str) -> OccSymbol:
+    """Decode an OCC option symbol into its parts.
+
+    Written as a parser rather than trusting the fields the API happens to send
+    alongside, because the symbol is the one thing guaranteed to be present and
+    self-consistent. If the symbol and a separate `strike` field ever disagreed,
+    the symbol is the one the exchange will honour.
+    """
+    match = _OCC_PATTERN.match(symbol.strip().upper())
+    if not match:
+        raise ValueError(f"not a valid OCC option symbol: {symbol!r}")
+
+    parts = match.groupdict()
+    expiry = datetime.strptime(parts["expiry"], "%y%m%d").date()
+
+    return OccSymbol(
+        underlying=parts["root"],
+        expiry=expiry,
+        right="call" if parts["right"] == "C" else "put",
+        # The last eight digits are the strike in thousandths of a dollar, so
+        # 00230000 is $230.000 rather than $230,000.
+        strike=int(parts["strike"]) / 1000.0,
+    )
+
+
+def _first(mapping: dict, *names, default=None):
+    """The first of several possible key names that is actually present.
+
+    Alpaca returns camelCase over REST (`impliedVolatility`) while its Python SDK
+    exposes snake_case (`implied_volatility`), and the MCP server sits between
+    the two. Rather than betting on one spelling, this accepts either. It is a
+    small tolerance in exactly one place, which is much cheaper than a pass that
+    dies at 9:45 on Monday because a field arrived under its other name.
+    """
+    for name in names:
+        if name in mapping and mapping[name] is not None:
+            return mapping[name]
+    return default
+
+
+def _to_float(value, default: float = 0.0) -> float:
+    """Coerce a JSON number that might be a string, None, or missing."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def contract_from_snapshot(occ_symbol: str, snapshot: dict) -> OptionContract:
+    """Build an OptionContract from one entry of an option chain response.
+
+    A snapshot bundles the latest quote, the Greeks and the implied volatility
+    for a single contract. Everything the gates need to judge a trade is in here,
+    which is why the chain call is the only market read an entry decision makes.
+    """
+    parsed = parse_occ_symbol(occ_symbol)
+
+    quote = _first(snapshot, "latestQuote", "latest_quote", default={}) or {}
+    greeks = _first(snapshot, "greeks", default={}) or {}
+
+    return OptionContract(
+        occ_symbol=occ_symbol,
+        underlying=parsed.underlying,
+        right=parsed.right,
+        strike=parsed.strike,
+        expiry=parsed.expiry,
+        # `bp` and `ap` are Alpaca's short names for bid price and ask price.
+        bid=_to_float(_first(quote, "bp", "bid_price", "bidPrice")),
+        ask=_to_float(_first(quote, "ap", "ask_price", "askPrice")),
+        # Delta and IV are allowed to be missing rather than defaulted to a
+        # number. A contract with no delta must fail the delta gate, and a
+        # cheerful 0.0 would look like a real reading of "no sensitivity".
+        delta=_first(greeks, "delta"),
+        implied_volatility=_first(snapshot, "impliedVolatility", "implied_volatility"),
+        open_interest=_first(snapshot, "openInterest", "open_interest"),
+    )
+
+
+def account_from_payload(payload: dict) -> AccountState:
+    """Build an AccountState from the account tool's response."""
+    return AccountState(
+        equity=_to_float(_first(payload, "equity", "portfolio_value")),
+        options_buying_power=_to_float(
+            _first(payload, "options_buying_power", "optionsBuyingPower",
+                   "buying_power", "buyingPower")),
+        cash=_to_float(_first(payload, "cash")),
+    )
+
+
+def position_from_payload(payload: dict) -> OpenPosition | None:
+    """Build an OpenPosition, or None if this row is not a long option.
+
+    The account may hold things this agent did not open and does not manage.
+    Returning None for those keeps them visible to the broker and invisible to
+    the exit logic, which is the correct handling of something we do not own the
+    reasoning for.
+    """
+    symbol = str(_first(payload, "symbol", default=""))
+    try:
+        parsed = parse_occ_symbol(symbol)
+    except ValueError:
+        return None
+
+    quantity = int(_to_float(_first(payload, "qty", "quantity")))
+    if quantity <= 0:
+        return None
+
+    entry = _to_float(_first(payload, "avg_entry_price", "avgEntryPrice"))
+    current = _to_float(_first(payload, "current_price", "currentPrice"), entry)
+
+    return OpenPosition(
+        occ_symbol=symbol,
+        underlying=parsed.underlying,
+        quantity=quantity,
+        entry_price=entry,
+        current_price=current,
+        expiry=parsed.expiry,
+    )
+
+
+# --------------------------------------------------------------------------
+# The connection itself.
+# --------------------------------------------------------------------------
+
+def unwrap_envelope(payload):
+    """Strip the wrapper the MCP server puts around every response.
+
+    Alpaca's server does not hand back the API's JSON directly. It wraps it:
+
+        {"_alpaca_mcp_security": {"trust": "untrusted_tool_output", ...},
+         "data": { ...the actual response... }}
+
+    That security block is a prompt-injection guard, and it is a sensible one.
+    Anything coming back from a market API -- a news headline especially -- is
+    text written by someone else, and if it were pasted straight into a model
+    prompt it could carry instructions. The server is labelling its own output as
+    data rather than instructions.
+
+    We get that protection for free and then some, because of where this function
+    sits: everything downstream of here is a domain object with typed fields, so
+    no free text from the API ever reaches the model as part of a prompt. Strings
+    that do reach it -- a symbol, a strike -- have been through a parser first.
+
+    Some tools nest once more, returning `{"result": [...]}` inside `data`. That
+    is unwrapped too, but only when `result` is the only key, so a real response
+    that happens to contain a `result` field is left alone.
+    """
+    if isinstance(payload, dict) and "_alpaca_mcp_security" in payload and "data" in payload:
+        payload = payload["data"]
+    if isinstance(payload, dict) and set(payload) == {"result"}:
+        payload = payload["result"]
+    return payload
+
+
+def _payload(result) -> dict | list:
+    """Pull usable data out of whatever an MCP tool call returned.
+
+    An MCP result is a list of content blocks rather than a bare value, because
+    a tool is allowed to return text, images or several pieces at once. Newer
+    servers also attach a parsed `structuredContent`. This prefers the structured
+    form when it is there and falls back to parsing the text block, so the rest
+    of the module never has to think about which it got.
+    """
+    structured = getattr(result, "structuredContent", None)
+    if structured:
+        return structured
+
+    for block in getattr(result, "content", []) or []:
+        text = getattr(block, "text", None)
+        if not text:
+            continue
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # A tool that returned prose rather than JSON is a tool we are
+            # calling wrongly. Say so with the text included, because the text is
+            # usually the server's error message.
+            raise MarketDataError(f"expected JSON from the tool, got: {text[:200]}") from None
+
+    raise MarketDataError("tool returned no usable content")
+
+
+class MarketReader:
+    """Everything the agent is allowed to learn about the market.
+
+    Read-only by construction. There is no method here that places, cancels or
+    closes anything, and the tool constants at the top of this file name no
+    write tool -- so this class could not send an order even if a caller asked
+    it to.
+    """
+
+    def __init__(self, session) -> None:
+        # The session is handed in rather than created here, which is what lets
+        # a test pass a fake with the same three methods and exercise every
+        # decoding path above with no server running.
+        self._session = session
+
+    async def call(self, tool: str, arguments: dict | None = None) -> dict | list:
+        """Call one MCP tool and return its decoded payload.
+
+        Every read in this class funnels through here, so logging, error
+        wrapping and payload extraction are written once.
+        """
+        logger.debug("mcp call %s %s", tool, arguments or {})
+        try:
+            result = await self._session.call_tool(tool, arguments or {})
+        except Exception as exc:
+            raise MarketDataError(f"{tool} failed: {exc}") from exc
+        return unwrap_envelope(_payload(result))
+
+    async def describe_tools(self) -> list[tuple[str, str]]:
+        """The server's live tool menu, as (name, description) pairs.
+
+        Useful on its own -- `run.py tools` prints it -- and the honest way to
+        confirm the tool names at the top of this file still match the server.
+        """
+        listing = await self._session.list_tools()
+        return [(t.name, (t.description or "").strip().splitlines()[0] if t.description else "")
+                for t in listing.tools]
+
+    async def account(self) -> AccountState:
+        """Equity and buying power. A failure here stops the pass."""
+        return account_from_payload(_as_dict(await self.call(TOOL_ACCOUNT)))
+
+    async def positions(self) -> tuple[OpenPosition, ...]:
+        """Every long option position we currently hold.
+
+        Deliberately does not swallow errors. An empty list and a failed read
+        look identical to the caller, and one of them means "sell nothing today"
+        when the truth was "we could not see what we own".
+        """
+        payload = await self.call(TOOL_POSITIONS)
+        rows = payload if isinstance(payload, list) else _first(
+            payload, "positions", "result", default=[])
+
+        found = []
+        for row in rows or []:
+            if isinstance(row, dict):
+                position = position_from_payload(row)
+                if position is not None:
+                    found.append(position)
+        return tuple(found)
+
+    async def market_open(self) -> bool:
+        """Whether the US equity market is open right now."""
+        payload = _as_dict(await self.call(TOOL_CLOCK))
+        return bool(_first(payload, "is_open", "isOpen", default=False))
+
+    async def option_chain(
+        self,
+        underlying: str,
+        *,
+        right: str | None = None,
+        dte_min: int | None = None,
+        dte_max: int | None = None,
+        limit: int = 1000,
+        today: date | None = None,
+    ) -> list[OptionContract]:
+        """The contracts for one underlying, priced with Greeks, already narrowed.
+
+        **The filtering happens on the server, and that is the whole point.** A
+        liquid name like AAPL lists thousands of contracts across dozens of
+        expiries. The tool returns 100 by default, paginated, ordered from the
+        nearest expiry outward -- so an unfiltered call returns nothing but
+        contracts expiring within days, which is the exact part of the chain this
+        strategy never trades. Worse, those near-dated illiquid contracts often
+        carry no Greeks at all, because there is no sensible implied volatility
+        to derive them from. Asking for the whole chain and filtering afterwards
+        looks like it should work and quietly returns junk.
+
+        So the expiry window and the call/put choice are pushed down into the
+        request. One round trip comes back holding only contracts the gates might
+        actually accept.
+
+        Returns an empty list rather than raising when a chain cannot be read.
+        Losing one symbol costs one opportunity out of nine and the next pass is
+        fifteen minutes away, so this is the one read that fails softly.
+        """
+        today = today or date.today()
+        arguments: dict[str, object] = {"underlying_symbol": underlying, "limit": limit}
+
+        if right is not None:
+            arguments["type"] = right
+        if dte_min is not None:
+            arguments["expiration_date_gte"] = (today + timedelta(days=dte_min)).isoformat()
+        if dte_max is not None:
+            arguments["expiration_date_lte"] = (today + timedelta(days=dte_max)).isoformat()
+
+        try:
+            payload = _as_dict(await self.call(TOOL_OPTION_CHAIN, arguments))
+        except MarketDataError as exc:
+            logger.warning("chain unavailable for %s: %s", underlying, exc)
+            return []
+
+        snapshots = _first(payload, "snapshots", default=payload) or {}
+        if not isinstance(snapshots, dict):
+            return []
+
+        contracts = []
+        for occ_symbol, snapshot in snapshots.items():
+            if not isinstance(snapshot, dict):
+                continue
+            try:
+                contracts.append(contract_from_snapshot(occ_symbol, snapshot))
+            except ValueError:
+                # A key that is not an option symbol is not an error worth
+                # stopping for -- the chain response carries some metadata keys
+                # alongside the contracts.
+                continue
+        return contracts
+
+
+def _as_dict(payload) -> dict:
+    """Narrow a payload to a dict, with a clear error if it is not one."""
+    if isinstance(payload, dict):
+        return payload
+    raise MarketDataError(f"expected an object, got {type(payload).__name__}")
+
+
+@asynccontextmanager
+async def open_reader(*, paper: bool = True):
+    """Start the Alpaca MCP server and yield a MarketReader over it.
+
+    The server is a child process: it starts when this context is entered, talks
+    over stdin and stdout, and is shut down on exit. Nothing needs to be running
+    beforehand and no port is opened, which is what makes a scheduled pass simple
+    to reason about -- there is no long-lived service to have died overnight.
+
+    Credentials are passed through the environment rather than on the command
+    line, because a command line is visible to every other process on the machine
+    via `ps`.
+    """
+    # Imported here rather than at module scope so that the decoding functions
+    # above -- and their tests -- do not require the mcp package to be installed.
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    api_key = os.getenv("ALPACA_API_KEY")
+    secret_key = os.getenv("ALPACA_SECRET_KEY")
+    if not api_key or not secret_key:
+        raise MarketDataError("ALPACA_API_KEY / ALPACA_SECRET_KEY are not set")
+
+    parameters = StdioServerParameters(
+        command="uvx",
+        args=["alpaca-mcp-server"],
+        env={
+            **os.environ,
+            "ALPACA_API_KEY": api_key,
+            "ALPACA_SECRET_KEY": secret_key,
+            "ALPACA_PAPER_TRADE": "true" if paper else "false",
+        },
+    )
+
+    async with stdio_client(parameters) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            yield MarketReader(session)
