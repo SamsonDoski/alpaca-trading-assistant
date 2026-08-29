@@ -4,6 +4,9 @@
     python run.py account             equity and buying power
     python run.py positions           what we currently hold
     python run.py chain AAPL          the tradable slice of one option chain
+    python run.py trade               one full pass (dry run unless --live)
+    python run.py journal             what it did and declined today
+    python run.py notify-test         check the Discord webhook
     python run.py raw get_clock       call any read tool and dump its JSON
 
 The last one exists for a specific reason. The MCP server builds its tool list
@@ -259,6 +262,106 @@ async def cmd_propose(args) -> int:
     return 0
 
 
+async def cmd_trade(args) -> int:
+    """One full pass: manage exits, then look for entries.
+
+    This is what the schedule runs. Everything it needs is constructed here and
+    handed to `run_pass`, which owns only the order things happen in.
+    """
+    import anthropic
+
+    from agent.executor import CliExecutor
+    from agent.journal import Journal
+    from agent.loop import run_pass
+    from agent.notify import Notifier
+    from agent.proposer import Proposer
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        print("  [stop] ANTHROPIC_API_KEY is not set in .env")
+        return 1
+
+    settings = load_settings(args.config)
+    executor = CliExecutor(dry_run=not args.live)
+    notifier = Notifier(os.getenv("DISCORD_WEBHOOK_URL"))
+    journal = Journal()
+
+    mode = "LIVE on the paper account" if args.live else "DRY RUN -- nothing will be sent"
+    print(f"\n  {mode}")
+    print(f"  {len(settings.symbols)} symbols, "
+          f"{settings.stop_loss_pct:.0%} stop / {settings.take_profit_pct:.0%} target "
+          f"({settings.break_even_win_rate:.0%} break-even win rate)")
+
+    async with open_reader() as reader:
+        result = await run_pass(
+            reader,
+            settings=settings,
+            executor=executor,
+            proposer=Proposer(anthropic.Anthropic()),
+            journal=journal,
+            notifier=notifier,
+            ignore_clock=args.ignore_clock,
+            trading_halted=os.getenv("TRADING_HALTED", "").lower() in ("true", "1", "yes"),
+        )
+
+    print(f"\n  {result.skipped_before_model} screened out before any model call")
+    print(f"  {result.considered} considered · {result.opened} opened · "
+          f"{result.closed} closed")
+
+    if result.refusals:
+        print("\n  CONSIDERED AND DECLINED")
+        for symbol, reason in result.refusals:
+            print(f"    {symbol:<8} {reason}")
+
+    if result.errors:
+        print("\n  ERRORS")
+        for error in result.errors:
+            print(f"    {error}")
+        return 1
+    return 0
+
+
+async def cmd_notify_test(args) -> int:
+    """Send a probe to the Discord webhook and report the real result."""
+    from agent.notify import Notifier
+
+    notifier = Notifier(os.getenv("DISCORD_WEBHOOK_URL"))
+    if not notifier.enabled:
+        print("\n  [fail] DISCORD_WEBHOOK_URL is not set in .env")
+        return 1
+
+    ok, detail = notifier.verify()
+    print(f"\n  {'[ok]' if ok else '[fail]'} {detail}")
+    return 0 if ok else 1
+
+
+async def cmd_journal(args) -> int:
+    """What the agent did and declined today."""
+    from agent.journal import Journal
+
+    journal = Journal()
+    decisions = journal.decisions_for_day()
+    events = journal.recent(limit=args.limit)
+
+    print(f"\n  {len(decisions)} decision(s) today\n")
+    for row in decisions[:args.limit]:
+        mark = "OPEN " if row.approved else "skip "
+        conviction = f"{row.confidence:.2f}" if row.confidence is not None else "  -- "
+        print(f"    {row.at[11:16]}  {mark} {row.underlying:<7} {conviction}  "
+              f"{row.reason[:70]}")
+
+    if events:
+        print(f"\n  Recent events\n")
+        for event in events:
+            pnl = f"  ${event.pnl:+,.0f}" if event.pnl is not None else ""
+            print(f"    {event.at[:16]}  {event.action:<7} {event.symbol:<24} "
+                  f"{event.detail[:60]}{pnl}")
+
+    totals = journal.summary()
+    print(f"\n  Lifetime: {totals['closed']} closed, "
+          f"{totals['win_rate']:.0%} won, ${totals['total_pnl']:+,.0f}")
+    return 0
+
+
 async def cmd_raw(args) -> int:
     """Call one read tool and print exactly what came back."""
     arguments = json.loads(args.arguments) if args.arguments else {}
@@ -297,6 +400,20 @@ def main() -> int:
     propose.add_argument("--live", action="store_true",
                          help="with --execute, actually place the order")
     propose.set_defaults(func=cmd_propose)
+
+    trade = sub.add_parser("trade", help="one full pass: exits, then entries")
+    trade.add_argument("--live", action="store_true",
+                       help="actually place orders (default is a dry run)")
+    trade.add_argument("--ignore-clock", action="store_true",
+                       help="run as if the market were open")
+    trade.set_defaults(func=cmd_trade)
+
+    sub.add_parser("notify-test", help="check the Discord webhook works").set_defaults(
+        func=cmd_notify_test)
+
+    jrnl = sub.add_parser("journal", help="what the agent did and declined today")
+    jrnl.add_argument("--limit", type=int, default=30)
+    jrnl.set_defaults(func=cmd_journal)
 
     raw = sub.add_parser("raw", help="call any read tool and dump its JSON")
     raw.add_argument("tool")

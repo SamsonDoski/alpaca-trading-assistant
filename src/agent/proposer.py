@@ -63,8 +63,13 @@ class ProposalSchema(BaseModel):
         ge=0.0, le=1.0,
         description="How convinced you are, from 0.0 to 1.0. Use the full "
                     "range honestly; 0.5 means genuinely balanced.")
+    # 800, not 400. A live pass lost a decision to a ValidationError because
+    # the model wrote a 430-character rationale -- it failed closed, so nothing
+    # unsafe happened, but a well-reasoned answer was thrown away over
+    # formatting. The cap exists to stop an essay reaching Discord, not to
+    # referee sentence length, so it is set where an essay actually starts.
     rationale: str = Field(
-        max_length=400,
+        max_length=800,
         description="One or two sentences explaining the call, written for a "
                     "human reading a trade log later.")
 
@@ -199,7 +204,15 @@ class Proposer:
             )
         except Exception as exc:
             logger.warning("proposer failed for %s: %s", brief.underlying, exc)
-            return _no_view(brief.underlying, f"analysis unavailable ({type(exc).__name__})")
+            # The exception text goes into the reason, not just its class name.
+            # "analysis unavailable (ValidationError)" told us something broke
+            # but not what, and the difference between a rate limit and a schema
+            # violation is the difference between waiting and fixing.
+            detail = str(exc).strip().splitlines()[0][:160] if str(exc).strip() else ""
+            return _no_view(
+                brief.underlying,
+                f"analysis unavailable ({type(exc).__name__}"
+                + (f": {detail}" if detail else "") + ")")
 
         # A safety classifier may decline to answer. That arrives as a normal
         # 200 response, not an exception, so it has to be checked rather than

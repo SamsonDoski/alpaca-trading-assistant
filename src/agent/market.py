@@ -64,6 +64,7 @@ TOOL_OPTION_SNAPSHOT = "get_option_snapshot"
 TOOL_STOCK_QUOTE = "get_stock_latest_quote"
 TOOL_STOCK_BARS = "get_stock_bars"
 TOOL_NEWS = "get_news"
+TOOL_OPTION_QUOTE = "get_option_latest_quote"
 
 
 class MarketDataError(RuntimeError):
@@ -412,6 +413,29 @@ class MarketReader:
                 continue
         return contracts
 
+
+    async def option_quote(self, occ_symbol: str) -> tuple[float, float] | None:
+        """The latest bid and ask for one contract, or None if unquoted.
+
+        Used when closing a position. The broker reports a mark price on the
+        position itself, but a mark is a valuation, not something anyone has
+        offered to pay -- and an exit has to be priced against a real bid.
+        """
+        try:
+            payload = _as_dict(await self.call(TOOL_OPTION_QUOTE,
+                                               {"symbol_or_symbols": occ_symbol}))
+        except MarketDataError as exc:
+            logger.warning("no quote for %s: %s", occ_symbol, exc)
+            return None
+
+        quotes = _first(payload, "quotes", default=payload) or {}
+        quote = quotes.get(occ_symbol) if isinstance(quotes, dict) else None
+        if not isinstance(quote, dict):
+            return None
+
+        bid = _to_float(_first(quote, "bp", "bid_price", "bidPrice"))
+        ask = _to_float(_first(quote, "ap", "ask_price", "askPrice"))
+        return (bid, ask) if bid > 0 or ask > 0 else None
 
     async def recent_bars(self, symbol: str, days: int = 120) -> list[PriceBar]:
         """Daily bars for the underlying, oldest first.

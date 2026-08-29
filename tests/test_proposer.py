@@ -139,6 +139,22 @@ def test_an_api_error_becomes_no_view_rather_than_an_exception():
     assert "unavailable" in proposal.rationale
 
 
+def test_a_failure_reason_names_what_actually_broke():
+    """A live pass reported only "(ValidationError)", which said something
+    broke but not what. A rate limit and a schema violation need different
+    responses, so the message has to tell them apart."""
+    proposal = Proposer(FakeClient(error=RuntimeError("rate limit exceeded"))).propose(
+        make_brief())
+    assert "rate limit exceeded" in proposal.rationale
+
+
+def test_a_long_rationale_is_accepted():
+    """400 characters was too tight -- a real answer was thrown away over
+    formatting. The cap exists to stop an essay, not to referee sentences."""
+    long_answer = "x" * 700
+    ProposalSchema(direction="up", confidence=0.6, rationale=long_answer)
+
+
 def test_a_safety_refusal_becomes_no_view():
     """A refusal arrives as a normal 200 response, so it has to be checked
     rather than caught."""
