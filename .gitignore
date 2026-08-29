@@ -5,6 +5,7 @@
 state/*.db
 state/*.db-*
 state/*.lock
+state/*.log
 
 # Python
 .venv/

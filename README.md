@@ -60,6 +60,34 @@ reason they take a context object instead of fetching what they need. The part o
 this agent that must not be wrong is also the part that can be exercised
 exhaustively in under a second.
 
+## Deploying it
+
+```bash
+./deploy/install.sh
+```
+
+Installs the virtual environment, `uv`, and the Alpaca CLI; checks that `.env`
+holds every required key; confirms with the broker that the account is a paper
+account and refuses to schedule if it is not; runs the tests; and installs the
+crontab entry. Safe to re-run. Add `--live` to schedule real orders instead of a
+dry run.
+
+The schedule is every 15 minutes, weekdays, 13:00–20:59 UTC — deliberately wider
+than market hours. Encoding 09:30–16:00 Eastern precisely means the schedule is
+silently wrong twice a year when the clocks change, so cron fires generously and
+the market-open gate decides whether there is anything to do. A pass outside
+market hours reads the clock, finds it closed, and exits in about a second
+having spent nothing.
+
+**Fifteen minutes is a risk parameter, not a convenience.** Alpaca supports
+trailing stops for stocks, not options, so there is no protective order resting
+at the broker. Every stop in this system only exists while a pass is running,
+which makes the interval between passes the distance a position can travel
+unwatched.
+
+Watch it with `tail -f state/pass.log`; stop it by deleting the line from
+`crontab -e`.
+
 ## Disclosure of pre-existing work
 
 Per the hackathon FAQ, which permits reuse of a participant's own prior work

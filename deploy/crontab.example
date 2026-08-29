@@ -1,0 +1,37 @@
+# Crontab for the trading agent. Install with `deploy/install.sh`, or paste the
+# line below into `crontab -e` with PROJECT_DIR replaced by the real path.
+#
+# ---------------------------------------------------------------------------
+# WHY THE WINDOW IS DELIBERATELY TOO WIDE
+#
+# The US market trades 09:30-16:00 Eastern, which is 13:30-20:00 UTC in summer
+# and 14:30-21:00 UTC in winter. Encoding that precisely means the schedule is
+# wrong twice a year, and wrong in a way nothing reports -- the agent simply
+# stops trading for the first hour of every day and no error is raised.
+#
+# So cron fires generously, 13:00-20:59 UTC, and the market-open gate decides
+# whether there is anything to do. A pass outside market hours reads the clock,
+# finds it closed, and exits in about a second having spent nothing: no model
+# call, no order, no tokens. The authority on whether the market is open is the
+# broker, which is the only thing that actually knows about half-days and
+# holidays.
+#
+# Deliberately trading correctness for a handful of no-op runs a day.
+# ---------------------------------------------------------------------------
+#
+# WHICH MODE
+#
+# The line below runs in DRY RUN: every decision is made, journalled and
+# announced, and Alpaca validates each order without placing it. Add --live to
+# the end to place orders for real. That word is the entire difference between
+# a rehearsal and a competition entry, which is why it lives here in plain
+# sight rather than in a config file.
+
+PATH=/usr/local/bin:/usr/bin:/bin
+SHELL=/bin/bash
+
+# min  hour   dom mon dow   command
+*/15   13-20  *   *   1-5   PROJECT_DIR/deploy/run_pass.sh
+
+# For the competition, replace that line with:
+# */15   13-20  *   *   1-5   PROJECT_DIR/deploy/run_pass.sh --live
