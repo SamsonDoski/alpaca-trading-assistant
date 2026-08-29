@@ -1,0 +1,14 @@
+# Secrets. Never commit these -- the repository is public at submission.
+.env
+
+# Local state: the journal is this machine's audit trail, not source code.
+state/*.db
+state/*.db-*
+state/*.lock
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/

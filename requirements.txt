@@ -1,0 +1,14 @@
+# Model. The proposer runs on Claude Opus 5.
+anthropic>=0.40.0
+
+# MCP client. Reads option chains, quotes and Greeks from Alpaca's official
+# MCP server. Orders do NOT go through this -- see docs/architecture.md.
+mcp>=1.2.0
+
+# Config and environment.
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# Tests and linting.
+pytest>=8.0
+ruff>=0.6

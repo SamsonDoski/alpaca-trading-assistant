@@ -1,0 +1,20 @@
+# Overrides for the defaults in src/agent/settings.py.
+#
+# The reasoning behind every value lives in that file, next to the field it
+# belongs to, so this stays a short list of what is actually being changed
+# rather than a second copy of the rule book that can drift out of step.
+#
+# Any key here must exist on Settings. An unknown key raises on load instead of
+# being ignored, because a typo in a risk limit that silently keeps the default
+# is invisible until it costs money.
+
+symbols:
+  - SPY
+  - QQQ
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMZN
+  - META
+  - GOOGL
+  - TSLA
