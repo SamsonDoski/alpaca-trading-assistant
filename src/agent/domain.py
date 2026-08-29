@@ -170,6 +170,83 @@ class OpenPosition:
 
 
 @dataclass(frozen=True, slots=True)
+class PriceBar:
+    """One day of trading in the underlying."""
+
+    day: date
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+@dataclass(frozen=True, slots=True)
+class MarketBrief:
+    """Everything the model is shown about one underlying, and nothing else.
+
+    Assembling this as a value first, rather than building a prompt string as
+    the data arrives, buys two things. A test can construct any market condition
+    it wants without a network. And because the brief is a fixed shape, what the
+    model sees is auditable -- you can print it, store it, and answer "what did
+    it know when it decided that?" without re-running anything.
+    """
+
+    underlying: str
+    as_of: date
+    bars: tuple[PriceBar, ...]                  # daily, oldest first
+    candidates: tuple[OptionContract, ...]      # already inside the expiry window
+    headlines: tuple[str, ...] = ()
+
+    @property
+    def spot(self) -> float:
+        """The most recent close, or zero if there is no price history."""
+        return self.bars[-1].close if self.bars else 0.0
+
+    def change_pct(self, lookback: int) -> float | None:
+        """Return over the last `lookback` sessions, or None if unmeasurable.
+
+        **None, not 0.0, and the distinction is not pedantry.** An earlier
+        version returned 0.0 when the series was too short, on the reasoning
+        that a flat number reads as "no trend". A live run disproved that
+        immediately: only 42 bars came back, the brief reported a 60-day change
+        of +0.00%, and the model wrote "flat over 60 days" in its rationale --
+        treating a gap in our data as a measured fact about the market.
+
+        A value that means "we could not measure this" must not be spelled the
+        same way as a value that means "we measured it and it was zero".
+        """
+        if len(self.bars) < lookback + 1:
+            return None
+        earlier = self.bars[-(lookback + 1)].close
+        if earlier <= 0:
+            return None
+        return (self.bars[-1].close - earlier) / earlier
+
+    @property
+    def range_position(self) -> float:
+        """Where the current price sits in its recent range, from 0.0 to 1.0.
+
+        0.0 means sitting on the period low, 1.0 on the high. One number that
+        says more about context than the raw price does, because it is already
+        scaled -- $310 means nothing on its own, but "near the top of its
+        recent range" means the same thing on any stock.
+        """
+        if not self.bars:
+            return 0.5
+        high = max(b.high for b in self.bars)
+        low = min(b.low for b in self.bars)
+        if high <= low:
+            return 0.5
+        return (self.spot - low) / (high - low)
+
+    def contracts_for(self, direction: Direction) -> tuple[OptionContract, ...]:
+        """The candidates that express one direction."""
+        right = direction.option_right
+        return tuple(c for c in self.candidates if c.right == right)
+
+
+@dataclass(frozen=True, slots=True)
 class Proposal:
     """What the model produced: a view on one underlying, and its reasoning.
 

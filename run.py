@@ -149,6 +149,62 @@ async def cmd_chain(args) -> int:
     return 0
 
 
+async def cmd_propose(args) -> int:
+    """Run the full read-and-reason pipeline for one symbol.
+
+    This is the whole agent minus the parts that spend money: it gathers a
+    brief, asks for a view, and prints what came back. Nothing is sized and
+    nothing is ordered.
+    """
+    import os
+
+    import anthropic
+
+    from agent.market import build_brief
+    from agent.proposer import Proposer, render_brief
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        print("\n  [stop] ANTHROPIC_API_KEY is not set in .env")
+        return 1
+
+    settings = load_settings(args.config)
+    symbol = args.symbol.upper()
+
+    async with open_reader() as reader:
+        brief = await build_brief(reader, symbol, settings)
+
+    if args.show_brief:
+        print("\n" + "-" * 72)
+        print(render_brief(brief))
+        print("-" * 72)
+
+    print(f"\n  {len(brief.bars)} daily bars, {len(brief.candidates)} contracts in range, "
+          f"{len(brief.headlines)} headlines")
+    print("  asking Claude...\n")
+
+    proposal = Proposer(anthropic.Anthropic()).propose(brief)
+
+    if proposal.thinking_summary:
+        print("  REASONING")
+        for line in proposal.thinking_summary.splitlines():
+            print(f"    {line}")
+        print()
+
+    if not proposal.is_actionable:
+        print(f"  NO TRADE -- {proposal.rationale}")
+        return 0
+
+    print(f"  PROPOSAL: {proposal.direction.value.upper()} on {proposal.underlying} "
+          f"(confidence {proposal.confidence:.2f})")
+    print(f"  {proposal.rationale}")
+
+    floor = settings.min_confidence
+    if proposal.confidence < floor:
+        print(f"\n  ...which the confidence gate would refuse: "
+              f"{proposal.confidence:.2f} is below the {floor:.2f} floor.")
+    return 0
+
+
 async def cmd_raw(args) -> int:
     """Call one read tool and print exactly what came back."""
     arguments = json.loads(args.arguments) if args.arguments else {}
@@ -175,6 +231,12 @@ def main() -> int:
     chain.add_argument("symbol")
     chain.add_argument("--puts", action="store_true", help="show puts instead of calls")
     chain.set_defaults(func=cmd_chain)
+
+    propose = sub.add_parser("propose", help="gather a brief and ask Claude for a view")
+    propose.add_argument("symbol")
+    propose.add_argument("--show-brief", action="store_true",
+                         help="print exactly what the model was shown")
+    propose.set_defaults(func=cmd_propose)
 
     raw = sub.add_parser("raw", help="call any read tool and dump its JSON")
     raw.add_argument("tool")

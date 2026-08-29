@@ -29,6 +29,7 @@ difference matters:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -37,7 +38,13 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
-from agent.domain import AccountState, OpenPosition, OptionContract
+from agent.domain import (
+    AccountState,
+    MarketBrief,
+    OpenPosition,
+    OptionContract,
+    PriceBar,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +62,8 @@ TOOL_CLOCK = "get_clock"
 TOOL_OPTION_CHAIN = "get_option_chain"
 TOOL_OPTION_SNAPSHOT = "get_option_snapshot"
 TOOL_STOCK_QUOTE = "get_stock_latest_quote"
+TOOL_STOCK_BARS = "get_stock_bars"
+TOOL_NEWS = "get_news"
 
 
 class MarketDataError(RuntimeError):
@@ -402,6 +411,131 @@ class MarketReader:
                 # alongside the contracts.
                 continue
         return contracts
+
+
+    async def recent_bars(self, symbol: str, days: int = 120) -> list[PriceBar]:
+        """Daily bars for the underlying, oldest first.
+
+        `days` is CALENDAR days, not sessions. Markets are open about five days
+        in seven and closed on holidays, so 120 calendar days yields roughly 82
+        trading sessions. The brief reports a 60-session trend, and asking for 60
+        calendar days returned only 42 -- not enough to compute it.
+
+        Fails softly for the same reason the chain does: this feeds the model's
+        sense of context, and a symbol with no readable history simply gets no
+        opinion this pass.
+        """
+        try:
+            payload = _as_dict(await self.call(TOOL_STOCK_BARS, {
+                "symbols": symbol,
+                "timeframe": "1Day",
+                "days": days,
+                "limit": days,
+                "sort": "asc",
+            }))
+        except MarketDataError as exc:
+            logger.warning("bars unavailable for %s: %s", symbol, exc)
+            return []
+
+        # The response is keyed by symbol because the tool accepts several.
+        series = _first(payload, "bars", default={}) or {}
+        rows = series.get(symbol, []) if isinstance(series, dict) else series
+
+        bars = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            stamp = str(_first(row, "t", "timestamp", default=""))[:10]
+            try:
+                day = datetime.strptime(stamp, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            bars.append(PriceBar(
+                day=day,
+                open=_to_float(_first(row, "o", "open")),
+                high=_to_float(_first(row, "h", "high")),
+                low=_to_float(_first(row, "l", "low")),
+                close=_to_float(_first(row, "c", "close")),
+                volume=_to_float(_first(row, "v", "volume")),
+            ))
+        return bars
+
+    async def headlines(self, symbol: str, limit: int = 6) -> list[str]:
+        """Recent news headlines for the underlying.
+
+        Headlines are the one piece of free text in this system, and they are
+        written by strangers. They are carried as plain strings and handed to the
+        model inside a clearly fenced block, with the system prompt instructing
+        it to treat them as reported facts rather than instructions. Anything
+        that cannot be reduced to a headline string never travels further.
+        """
+        try:
+            payload = await self.call(TOOL_NEWS, {
+                "symbols": symbol,
+                "limit": limit,
+                "exclude_contentless": True,
+                "sort": "desc",
+            })
+        except MarketDataError as exc:
+            logger.warning("news unavailable for %s: %s", symbol, exc)
+            return []
+
+        rows = payload if isinstance(payload, list) else _first(
+            _as_dict(payload), "news", "result", default=[])
+
+        found = []
+        for row in rows or []:
+            if isinstance(row, dict):
+                text = _first(row, "headline", "title")
+                if text:
+                    found.append(str(text).strip())
+        return found[:limit]
+
+
+async def build_brief(reader: MarketReader, underlying: str, settings,
+                      *, today: date | None = None) -> MarketBrief:
+    """Gather everything the model will see about one symbol.
+
+    The three reads are independent, so they run concurrently rather than one
+    after another. Multiply that saving by nine symbols and it is the difference
+    between a pass that finishes comfortably inside its fifteen-minute slot and
+    one that does not.
+
+    `asyncio.gather` with `return_exceptions=True` is deliberate: a failure in
+    any one read yields an empty section rather than an exception that takes the
+    whole brief down. Each of these three already fails softly on its own; this
+    guarantees it at the assembly point too.
+    """
+    today = today or date.today()
+
+    bars, calls, puts, news = await asyncio.gather(
+        reader.recent_bars(underlying),
+        reader.option_chain(underlying, right="call",
+                            dte_min=settings.dte_min, dte_max=settings.dte_max, today=today),
+        reader.option_chain(underlying, right="put",
+                            dte_min=settings.dte_min, dte_max=settings.dte_max, today=today),
+        reader.headlines(underlying),
+        return_exceptions=True,
+    )
+
+    def usable(result):
+        return result if isinstance(result, list) else []
+
+    # Only contracts inside the delta band are shown. The model is choosing a
+    # direction, not shopping a chain, and a thousand strikes of context would
+    # cost tokens without improving that judgement.
+    candidates = [
+        c for c in usable(calls) + usable(puts)
+        if settings.delta_min <= c.abs_delta <= settings.delta_max
+    ]
+
+    return MarketBrief(
+        underlying=underlying,
+        as_of=today,
+        bars=tuple(usable(bars)),
+        candidates=tuple(sorted(candidates, key=lambda c: (c.right, c.strike))),
+        headlines=tuple(usable(news)),
+    )
 
 
 def _as_dict(payload) -> dict:
