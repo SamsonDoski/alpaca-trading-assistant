@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -156,8 +157,6 @@ async def cmd_propose(args) -> int:
     brief, asks for a view, and prints what came back. Nothing is sized and
     nothing is ordered.
     """
-    import os
-
     import anthropic
 
     from agent.market import build_brief
@@ -167,10 +166,39 @@ async def cmd_propose(args) -> int:
         print("\n  [stop] ANTHROPIC_API_KEY is not set in .env")
         return 1
 
+    from agent.entry import decide_entry
+    from agent.gates import GateContext, screen
+
     settings = load_settings(args.config)
     symbol = args.symbol.upper()
 
+    # Exactly the order the live loop uses: assemble the world, run the free
+    # entry screen, and only then spend a model call.
     async with open_reader() as reader:
+        account, positions, is_open = await asyncio.gather(
+            reader.account(), reader.positions(), reader.market_open())
+
+        ctx = GateContext(
+            today=date.today(),
+            market_open=is_open or args.ignore_clock,
+            trading_halted=os.getenv("TRADING_HALTED", "").lower() in ("true", "1", "yes"),
+            account=account,
+            open_positions=positions,
+            cooling_off={},
+            settings=settings,
+        )
+
+        screening = screen(symbol, ctx)
+        print(f"\n  ENTRY SCREEN ({len(screening.trace)} gates run)")
+        for name, verdict in screening.trace:
+            mark = "pass" if verdict.decision.value == "allow" else "REFUSE"
+            print(f"    {mark:>6}  {name}"
+                  + (f" -- {verdict.reason}" if verdict.reason else ""))
+
+        if not screening.approved:
+            print(f"\n  STOPPED before the model call. No tokens spent.")
+            return 0
+
         brief = await build_brief(reader, symbol, settings)
 
     if args.show_brief:
@@ -190,18 +218,27 @@ async def cmd_propose(args) -> int:
             print(f"    {line}")
         print()
 
-    if not proposal.is_actionable:
-        print(f"  NO TRADE -- {proposal.rationale}")
-        return 0
+    if proposal.is_actionable:
+        print(f"  PROPOSAL: {proposal.direction.value.upper()} on {proposal.underlying} "
+              f"(confidence {proposal.confidence:.2f})")
+        print(f"  {proposal.rationale}\n")
 
-    print(f"  PROPOSAL: {proposal.direction.value.upper()} on {proposal.underlying} "
-          f"(confidence {proposal.confidence:.2f})")
-    print(f"  {proposal.rationale}")
+    outcome = decide_entry(proposal, brief, ctx)
 
-    floor = settings.min_confidence
-    if proposal.confidence < floor:
-        print(f"\n  ...which the confidence gate would refuse: "
-              f"{proposal.confidence:.2f} is below the {floor:.2f} floor.")
+    if outcome.trace:
+        print("  ORDER GATES")
+        for name, verdict in outcome.trace:
+            decision = verdict.decision.value
+            mark = {"allow": "pass", "shrink": "TRIM", "deny": "REFUSE"}[decision]
+            print(f"    {mark:>6}  {name}"
+                  + (f" -- {verdict.reason}" if verdict.reason else ""))
+        print()
+
+    if outcome.approved:
+        print(f"  APPROVED: {outcome.draft}")
+        print(f"  (nothing was ordered -- the executor is not built yet)")
+    else:
+        print(f"  NO TRADE -- {outcome.reason}")
     return 0
 
 
@@ -236,6 +273,8 @@ def main() -> int:
     propose.add_argument("symbol")
     propose.add_argument("--show-brief", action="store_true",
                          help="print exactly what the model was shown")
+    propose.add_argument("--ignore-clock", action="store_true",
+                         help="run the market-open gate as if the market were open")
     propose.set_defaults(func=cmd_propose)
 
     raw = sub.add_parser("raw", help="call any read tool and dump its JSON")
