@@ -6,6 +6,7 @@
     python run.py chain AAPL          the tradable slice of one option chain
     python run.py trade               one full pass (dry run unless --live)
     python run.py journal             what it did and declined today
+    python run.py report              render it all as one HTML file
     python run.py notify-test         check the Discord webhook
     python run.py raw get_clock       call any read tool and dump its JSON
 
@@ -362,6 +363,27 @@ async def cmd_journal(args) -> int:
     return 0
 
 
+async def cmd_report(args) -> int:
+    """Render the journal as a single self-contained HTML file."""
+    from agent.journal import Journal
+    from agent.report import write
+
+    account, positions = None, ()
+    if not args.offline:
+        try:
+            async with open_reader() as reader:
+                account, positions = await asyncio.gather(
+                    reader.account(), reader.positions())
+        except MarketDataError as exc:
+            print(f"  [note] could not reach the broker ({exc}); "
+                  f"reporting from the journal alone")
+
+    path = write(Journal(), args.output, account=account, positions=positions,
+                 dry_run=not args.live)
+    print(f"\n  wrote {path.resolve()}")
+    return 0
+
+
 async def cmd_raw(args) -> int:
     """Call one read tool and print exactly what came back."""
     arguments = json.loads(args.arguments) if args.arguments else {}
@@ -414,6 +436,14 @@ def main() -> int:
     jrnl = sub.add_parser("journal", help="what the agent did and declined today")
     jrnl.add_argument("--limit", type=int, default=30)
     jrnl.set_defaults(func=cmd_journal)
+
+    report = sub.add_parser("report", help="render the journal as one HTML file")
+    report.add_argument("--output", default="state/report.html")
+    report.add_argument("--offline", action="store_true",
+                        help="skip the broker read and use the journal only")
+    report.add_argument("--live", action="store_true",
+                        help="label the report as live rather than dry run")
+    report.set_defaults(func=cmd_report)
 
     raw = sub.add_parser("raw", help="call any read tool and dump its JSON")
     raw.add_argument("tool")

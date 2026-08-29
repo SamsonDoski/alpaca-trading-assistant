@@ -95,15 +95,30 @@ class Notifier:
                 for sym, pnl in book[:10])
             lines.append("\n**Open book:**\n" + rows)
 
-        if refusals:
-            rows = "\n".join(f"`{sym}` — {reason[:110]}" for sym, reason in refusals[:8])
-            lines.append("\n**Considered and declined:**\n" + rows)
-
         title = f"{datetime.now(UTC):%A %d %B, %H:%M} UTC"
         if dry_run:
             title += "  (dry run)"
 
         self._post(_embed(f"{_TAG}  Pass complete", title, "\n".join(lines), _BLUE))
+
+        # Declines go in their own message, or several. They used to be appended
+        # here, capped at eight entries of 110 characters each -- which on a pass
+        # where all nine symbols decline meant one symbol vanished entirely and
+        # every rationale was cut mid-sentence. That is precisely the content
+        # worth reading: a pass that trades nothing is only legible through its
+        # reasons. Discord caps an embed description at 4096 characters, so the
+        # list is split across as many messages as it needs rather than trimmed
+        # to fit one.
+        if refusals:
+            self._post_declines(refusals)
+
+    def _post_declines(self, refusals: list[tuple[str, str]]) -> None:
+        blocks = [f"**{symbol}** — {reason.strip()}" for symbol, reason in refusals]
+
+        for index, chunk in enumerate(_chunked(blocks, _EMBED_LIMIT)):
+            heading = ("Considered and declined" if index == 0
+                       else f"Considered and declined (continued {index + 1})")
+            self._post(_embed(f"{_TAG}  {heading}", "", "\n\n".join(chunk), _GREY))
 
     def _post(self, payload: dict) -> None:
         if not self._url:
@@ -134,6 +149,42 @@ class Notifier:
             return False, f"HTTP {exc.code}"
         except (urllib.error.URLError, OSError) as exc:
             return False, str(exc)
+
+
+# Discord's hard cap on an embed description is 4096 characters. Leaving a
+# margin means a long rationale can never push a block over the edge and cost
+# the whole message.
+_EMBED_LIMIT = 3800
+
+
+def _chunked(blocks: list[str], limit: int) -> list[list[str]]:
+    """Group blocks into batches that each fit inside one embed.
+
+    Splits between blocks, never inside one, so a rationale is either shown in
+    full or moved whole to the next message. A sentence cut in half is worse
+    than a sentence on the following card.
+
+    A single block longer than the limit is the one case where truncation is
+    unavoidable, and it is marked so the reader knows something was cut rather
+    than wondering why the model stopped mid-thought.
+    """
+    batches: list[list[str]] = []
+    current: list[str] = []
+    length = 0
+
+    for block in blocks:
+        if len(block) > limit:
+            block = block[: limit - 3] + "..."
+        # +2 for the blank line joining blocks.
+        if current and length + len(block) + 2 > limit:
+            batches.append(current)
+            current, length = [], 0
+        current.append(block)
+        length += len(block) + 2
+
+    if current:
+        batches.append(current)
+    return batches
 
 
 def _embed(author: str, title: str, description: str, colour: int) -> dict:
