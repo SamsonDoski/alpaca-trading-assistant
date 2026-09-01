@@ -35,12 +35,20 @@ from datetime import date
 from agent.domain import MarketBrief, OpenPosition, Proposal
 from agent.entry import decide_entry
 from agent.executor import CliExecutor, ExecutionError
-from agent.exits import ExitDecision, check_exit, exit_limit_price
+from agent.exits import (
+    ExitDecision,
+    ExitReason,
+    check_exit,
+    exit_limit_price,
+    stop_and_target,
+)
 from agent.gates import GateContext, screen
 from agent.journal import Journal
 from agent.market import MarketDataError, build_brief
 from agent.notify import Notifier
+from agent.pricing import average_true_range_pct
 from agent.proposer import Proposer
+from agent.selector import Candidate, select
 from agent.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -74,6 +82,7 @@ async def run_pass(
     today: date | None = None,
     ignore_clock: bool = False,
     trading_halted: bool = False,
+    selector_backend=None,
 ) -> PassResult:
     """Run one complete pass and return what it did.
 
@@ -110,7 +119,15 @@ async def run_pass(
 
     # --- 2. Exits, before anything else ----------------------------------
     for position in positions:
-        decision = check_exit(position, settings, today)
+        # The stop is keyed to the underlying, so the underlying's price is
+        # needed to evaluate it. Held names never reach the brief stage, so this
+        # is the exit path's only source for it. A failed read falls back to the
+        # premium rule rather than skipping the check -- an unmanaged position is
+        # worse than a bluntly managed one.
+        spot = await reader.stock_price(position.underlying)
+        decision = check_exit(position, settings, today,
+                              holding=journal.holding(position.occ_symbol),
+                              spot=spot)
         if decision is None:
             continue
         try:
@@ -140,6 +157,25 @@ async def run_pass(
         logger.warning(message)
         notifier.alert(message)
 
+    # Orders resting at the broker that have not filled. On a data feed where a
+    # limit can sit unexecuted for hours, this is not an edge case -- it is the
+    # normal state between placing an order and owning a position, and the gates
+    # are blind to it unless it is handed to them.
+    #
+    # A failed read stops entries rather than assuming none are resting. Missing
+    # a pass costs one opportunity; placing a second order on a name that
+    # already has one costs real money if the price later moves through both.
+    try:
+        pending = _pending_underlyings(executor)
+    except ExecutionError as exc:
+        message = (f"could not read resting orders ({exc}). Exits ran; entries are "
+                   f"skipped this pass rather than risk duplicating an open order.")
+        logger.error(message)
+        journal.record("alert", "", "", message)
+        notifier.alert(message)
+        result.errors.append(message)
+        return result
+
     ctx = GateContext(
         today=today,
         market_open=market_open,
@@ -147,6 +183,7 @@ async def run_pass(
         account=account,
         open_positions=tuple(positions),
         cooling_off=journal.cooling_off(within_days=settings.cooldown_days, as_of=today),
+        pending=pending,
         settings=settings,
     )
 
@@ -165,9 +202,19 @@ async def run_pass(
         await _finish(result, ctx, positions, journal, notifier, executor)
         return result
 
-    # --- 4. Gather and reason, concurrently ------------------------------
+    # --- 4. Gather and reason, concurrently but bounded ------------------
+    # The bound is the important word. Unlimited fan-out is what killed the
+    # agent once the watchlist grew: every symbol's four reads went out at
+    # once, the MCP server closed the connection under the load, and the pass
+    # died before it could do anything -- including check its own stops.
+    gate = asyncio.Semaphore(max(1, settings.max_concurrent_symbols))
+
+    async def gather_one(symbol: str):
+        async with gate:
+            return await build_brief(reader, symbol, settings, today=today)
+
     briefs = await asyncio.gather(
-        *(build_brief(reader, symbol, settings, today=today) for symbol in candidates),
+        *(gather_one(symbol) for symbol in candidates),
         return_exceptions=True,
     )
 
@@ -181,11 +228,15 @@ async def run_pass(
         else:
             usable.append(brief)
 
-    # The model calls are independent of one another, so they wait together.
-    # `to_thread` because the Anthropic client is synchronous; this keeps the
-    # event loop free rather than making nine calls in series.
+    # The model calls are independent of one another, so they wait together --
+    # under the same ceiling, because a reasoning model thinking for thirty
+    # symbols at once is its own way to hit a rate limit.
+    async def ask_one(brief: MarketBrief) -> Proposal:
+        async with gate:
+            return await asyncio.to_thread(proposer.propose, brief)
+
     proposals: list[Proposal] = await asyncio.gather(
-        *(asyncio.to_thread(proposer.propose, brief) for brief in usable))
+        *(ask_one(brief) for brief in usable))
     result.considered = len(proposals)
 
     # --- 5. Decide and order, strictly one at a time ---------------------
@@ -195,7 +246,39 @@ async def run_pass(
     ranked = sorted(zip(usable, proposals, strict=True),
                     key=lambda pair: pair[1].confidence, reverse=True)
 
+    # --- 5a. Authorise every candidate individually ----------------------
+    # Each is judged as if it were the only trade, which deliberately
+    # over-approves: slots, cash and concentration are cumulative, and cannot be
+    # applied until an order is chosen. That is what the second pass is for.
+    slate: list[Candidate] = []
     for brief, proposal in ranked:
+        outcome = decide_entry(proposal, brief, ctx)
+        if not outcome.approved:
+            journal.record_decision(brief.underlying, approved=False,
+                                    reason=outcome.reason, proposal=proposal,
+                                    trace=outcome.trace)
+            result.note(brief.underlying, outcome.reason)
+            continue
+        slate.append(Candidate(
+            draft=outcome.draft,
+            group=settings.correlation_groups.get(brief.underlying, brief.underlying),
+        ))
+
+    # --- 5b. Order the slate ---------------------------------------------
+    free_slots = max(0, settings.max_positions - ctx.committed_slots)
+    slate, selection_note = select(slate, backend=selector_backend,
+                                   settings=settings, slots=free_slots, today=today)
+    if slate:
+        logger.info("selection: %s", selection_note)
+        journal.record("selection", "", "", selection_note)
+
+    briefs_by_symbol = {b.underlying: b for b in usable}
+
+    # --- 5c. Walk the order and open, re-authorising as the book fills ---
+    for candidate in slate:
+        brief = briefs_by_symbol[candidate.underlying]
+        proposal = candidate.draft.proposal
+
         # Screen again, against the context as it now stands. The first screen
         # ran before any of this pass's orders existed, and opening a position
         # consumes a slot and the cash behind it -- so a candidate that was
@@ -211,6 +294,9 @@ async def run_pass(
             result.note(brief.underlying, rescreen.reason)
             continue
 
+        # The binding authorisation. The first pass judged this candidate alone;
+        # this one judges it against the book including anything opened earlier
+        # in this very walk, so slots, cash and concentration actually apply.
         outcome = decide_entry(proposal, brief, ctx)
         journal.record_decision(brief.underlying, approved=outcome.approved,
                                 reason=outcome.reason, proposal=proposal,
@@ -231,8 +317,26 @@ async def run_pass(
             result.errors.append(message)
             continue
 
-        detail = (f"{outcome.draft} — {proposal.confidence:.0%} confidence. "
-                  f"{proposal.rationale}")
+        # Write down where the underlying stood, and the levels that will decide
+        # this position's fate. Without this the stop has nothing to measure
+        # against and silently falls back to the premium rule it replaced.
+        stop_spot, target_spot = stop_and_target(
+            brief.spot, proposal.direction.value,
+            atr_pct=average_true_range_pct(brief.bars),
+            settings=settings)
+        journal.open_holding(
+            occ_symbol=outcome.draft.contract.occ_symbol,
+            underlying=brief.underlying,
+            direction=proposal.direction.value,
+            entry_spot=brief.spot,
+            entry_premium=outcome.draft.limit_price,
+            stop_spot=stop_spot,
+            target_spot=target_spot,
+        )
+
+        detail = (f"{outcome.draft} — {proposal.confidence:.0%} confidence, "
+                  f"stop {stop_spot:,.2f} / target {target_spot:,.2f} on "
+                  f"{brief.underlying} at {brief.spot:,.2f}. {proposal.rationale}")
         journal.record("opened", brief.underlying, outcome.draft.contract.occ_symbol,
                        detail)
         notifier.opened(outcome.draft.contract.occ_symbol, detail,
@@ -271,6 +375,9 @@ async def _close(decision: ExitDecision, reader, executor: CliExecutor,
               f"P&L ${pnl:+,.0f} ({position.return_pct:+.1%}) [{receipt.client_order_id}]")
 
     journal.record("closed", position.underlying, position.occ_symbol, detail, pnl=pnl)
+    # The holdings table tracks live positions only. Leaving a stale row would
+    # let a later re-entry inherit levels computed for a different trade.
+    journal.close_holding(position.occ_symbol)
     notifier.closed(position.occ_symbol, detail, won=pnl > 0)
 
 
@@ -280,9 +387,33 @@ def _detail_prefix(decision: ExitDecision) -> str:
     A stop-loss close must begin with exactly the string `journal.cooling_off`
     matches on, because that is what distinguishes "this thesis failed" from
     "this thesis worked and we banked it".
+
+    A premium backstop deliberately does NOT get that prefix, and so starts no
+    cooldown. It fires when the option collapsed while the underlying thesis
+    held -- nothing was disproved, so there is nothing to cool off from.
     """
-    from agent.exits import ExitReason
     return "stop loss" if decision.reason is ExitReason.STOP_LOSS else decision.reason.value
+
+
+def _pending_underlyings(executor: CliExecutor) -> frozenset[str]:
+    """Which underlyings have an unfilled order resting at the broker.
+
+    Reduced to underlyings rather than contract symbols because that is the
+    granularity the gates reason at: one position per underlying, one slot per
+    underlying. A resting call on MSFT should block a put on MSFT too.
+    """
+    from agent.market import parse_occ_symbol
+
+    found = set()
+    for order in executor.open_orders():
+        symbol = str(order.get("symbol", ""))
+        try:
+            found.add(parse_occ_symbol(symbol).underlying)
+        except ValueError:
+            # Not an option order -- something else placed it. Not ours to
+            # reason about, but not a reason to fail either.
+            continue
+    return frozenset(found)
 
 
 def _with_new_position(ctx: GateContext, draft) -> GateContext:

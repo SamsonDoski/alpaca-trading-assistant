@@ -13,6 +13,7 @@ from datetime import date
 import pytest
 
 from agent.domain import (
+    PriceBar,
     AccountState,
     Direction,
     MarketBrief,
@@ -32,8 +33,8 @@ SETTINGS = Settings()
 
 
 def contract(occ="AAPL261016C00310000", *, right="call", strike=310.0, expiry=MONTHLY,
-             bid=15.50, ask=16.00, delta=0.65) -> OptionContract:
-    return OptionContract(occ, "AAPL", right, strike, expiry, bid, ask, delta, 0.30, 900)
+             bid=15.50, ask=16.00, delta=0.65, iv=0.20) -> OptionContract:
+    return OptionContract(occ, "AAPL", right, strike, expiry, bid, ask, delta, iv, 900)
 
 
 def context(**overrides) -> GateContext:
@@ -49,8 +50,25 @@ def context(**overrides) -> GateContext:
     return GateContext(**{**defaults, **overrides})
 
 
+def bars_with_volatility(low: float = 310.0, high: float = 313.0,
+                         count: int = 25) -> tuple[PriceBar, ...]:
+    """Closes that alternate between two prices.
+
+    A deterministic way to give the fixture a real, known realized volatility.
+    Steadily rising closes -- the obvious choice -- produce near-constant log
+    returns and therefore a volatility of almost zero, which the price gates
+    would (correctly) refuse to divide by.
+    """
+    return tuple(
+        PriceBar(day=date(2026, 8, 1), open=low, high=high + 1, low=low - 1,
+                 close=(high if i % 2 else low), volume=1_000_000)
+        for i in range(count)
+    )
+
+
 def brief(*candidates) -> MarketBrief:
-    return MarketBrief(underlying="AAPL", as_of=TODAY, bars=(), candidates=tuple(candidates))
+    return MarketBrief(underlying="AAPL", as_of=TODAY, bars=bars_with_volatility(),
+                       candidates=tuple(candidates))
 
 
 def proposal(direction=Direction.UP, confidence=0.75, rationale="trend intact") -> Proposal:

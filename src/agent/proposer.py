@@ -33,18 +33,9 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from agent.domain import Direction, MarketBrief, Proposal
+from agent.models import ModelBackend
 
 logger = logging.getLogger(__name__)
-
-MODEL = "claude-opus-5"
-
-# `high` is the default and the sweet spot. At roughly a hundred calls a week
-# this whole component costs a few dollars, so effort is being chosen for
-# judgement quality rather than to save money.
-EFFORT = "high"
-
-MAX_TOKENS = 16_000
-
 
 class ProposalSchema(BaseModel):
     """The shape the model must answer in.
@@ -168,40 +159,28 @@ def _no_view(underlying: str, reason: str) -> Proposal:
 
 
 class Proposer:
-    """Turns a market brief into a directional proposal."""
+    """Turns a market brief into a directional proposal.
 
-    def __init__(self, client, *, model: str = MODEL, effort: str = EFFORT) -> None:
-        # The client is injected, exactly as the MCP session is in MarketReader.
-        # Same reason: it is what lets every path through this module be tested
-        # without spending money or needing a network.
-        self._client = client
-        self._model = model
-        self._effort = effort
+    Knows nothing about which model answers. It renders the brief, hands the
+    prompt to a backend, and maps whatever comes back into a Proposal -- which
+    means every failure path below is enforced identically whether the answer
+    came from Claude or from an open model on Featherless.
+    """
+
+    def __init__(self, backend: ModelBackend) -> None:
+        # Injected, exactly as the MCP session is in MarketReader. Same reason:
+        # it is what lets every path through this module be tested without
+        # spending money or needing a network.
+        self._backend = backend
+
+    @property
+    def backend_name(self) -> str:
+        return getattr(self._backend, "name", "unknown")
 
     def propose(self, brief: MarketBrief) -> Proposal:
         """Ask for a view. Never raises -- a failure becomes 'no view'."""
         try:
-            response = self._client.messages.parse(
-                model=self._model,
-                max_tokens=MAX_TOKENS,
-                # Adaptive thinking lets the model decide how hard to think.
-                # `display: summarized` is the part that matters operationally:
-                # without it the reasoning happens but comes back empty, and the
-                # journal would record a decision with no account of why.
-                thinking={"type": "adaptive", "display": "summarized"},
-                output_config={"effort": self._effort},
-                system=[{
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    # The system prompt is identical for all nine symbols in a
-                    # pass, so caching it means it is charged once rather than
-                    # nine times. This works only because nothing volatile --
-                    # no timestamp, no symbol -- appears above this point.
-                    "cache_control": {"type": "ephemeral"},
-                }],
-                messages=[{"role": "user", "content": render_brief(brief)}],
-                output_format=ProposalSchema,
-            )
+            verdict = self._backend.ask(SYSTEM_PROMPT, render_brief(brief))
         except Exception as exc:
             logger.warning("proposer failed for %s: %s", brief.underlying, exc)
             # The exception text goes into the reason, not just its class name.
@@ -214,16 +193,6 @@ class Proposer:
                 f"analysis unavailable ({type(exc).__name__}"
                 + (f": {detail}" if detail else "") + ")")
 
-        # A safety classifier may decline to answer. That arrives as a normal
-        # 200 response, not an exception, so it has to be checked rather than
-        # caught -- and it means the same thing as any other failure here.
-        if getattr(response, "stop_reason", None) == "refusal":
-            return _no_view(brief.underlying, "the model declined to answer")
-
-        verdict = getattr(response, "parsed_output", None)
-        if verdict is None:
-            return _no_view(brief.underlying, "no structured answer returned")
-
         if verdict.direction == "none":
             # An explicit refusal to trade is recorded as a real proposal with
             # the model's reasoning attached, not discarded. The journal should
@@ -233,7 +202,7 @@ class Proposer:
                 direction=Direction.UP,
                 confidence=0.0,
                 rationale=verdict.rationale,
-                thinking_summary=_thinking_of(response),
+                thinking_summary=verdict.reasoning,
             )
 
         return Proposal(
@@ -241,21 +210,5 @@ class Proposer:
             direction=Direction(verdict.direction),
             confidence=float(verdict.confidence),
             rationale=verdict.rationale,
-            thinking_summary=_thinking_of(response),
+            thinking_summary=verdict.reasoning,
         )
-
-
-def _thinking_of(response) -> str:
-    """The model's summarised reasoning, joined into one string.
-
-    Stored alongside every proposal. This is the difference between a trade log
-    that says what happened and one that says why, and it is most of what makes
-    the agent's behaviour reviewable after the fact.
-    """
-    parts = []
-    for block in getattr(response, "content", []) or []:
-        if getattr(block, "type", None) == "thinking":
-            text = getattr(block, "thinking", "") or ""
-            if text.strip():
-                parts.append(text.strip())
-    return "\n\n".join(parts)

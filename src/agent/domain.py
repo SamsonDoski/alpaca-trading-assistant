@@ -16,7 +16,7 @@ call site that happens to need it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from enum import Enum
 
@@ -140,6 +140,10 @@ class OpenPosition:
     entry_price: float       # per share, so 3.00 means $300 a contract
     current_price: float
     expiry: date | None
+    # "call" or "put". Decoded from the symbol when the position is read, so
+    # anything reasoning about directional exposure can do so without parsing
+    # the symbol again or consulting another table.
+    right: str = "call"
 
     @property
     def cost_basis(self) -> float:
@@ -167,6 +171,15 @@ class OpenPosition:
 
     def days_to_expiry(self, on: date) -> int | None:
         return (self.expiry - on).days if self.expiry else None
+
+    @property
+    def direction(self) -> Direction:
+        """The view this position expresses.
+
+        A call is a bet up and a put a bet down, so the contract type IS the
+        direction and no separate record of intent can drift away from it.
+        """
+        return Direction.UP if self.right == "call" else Direction.DOWN
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +303,14 @@ class OrderDraft:
     quantity: int
     limit_price: float       # per share
 
+    # Carried on the draft because the gates that judge the PRICE of an option
+    # need them, and a gate is not allowed to fetch anything for itself. The
+    # spot places the contract on the underlying's scale; realized volatility
+    # says what movement that underlying actually delivers, which is the only
+    # thing that makes an implied volatility number mean anything.
+    spot: float = 0.0
+    realized_vol: float | None = None
+
     @property
     def total_cost(self) -> float:
         return self.limit_price * self.quantity * SHARES_PER_CONTRACT
@@ -301,7 +322,7 @@ class OrderDraft:
         which is what lets the gate runner hold on to the original and report
         both the requested size and the final one in the audit trail.
         """
-        return OrderDraft(self.proposal, self.contract, quantity, self.limit_price)
+        return replace(self, quantity=quantity)
 
     def __str__(self) -> str:
         c = self.contract

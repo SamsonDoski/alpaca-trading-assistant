@@ -44,6 +44,26 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_day ON events(day DESC);
 CREATE INDEX IF NOT EXISTS idx_events_action ON events(action);
 
+-- What the world looked like when we opened a position.
+--
+-- The broker knows what we hold and what we paid. It does not know what the
+-- UNDERLYING was worth at that moment, and without that number an
+-- underlying-keyed stop is impossible: you cannot say "exit if the stock falls
+-- 4% from entry" if you never wrote down where entry was.
+--
+-- Keyed by contract symbol and deleted on close, so this table holds only live
+-- positions -- it is working state, not history. History lives in `events`.
+CREATE TABLE IF NOT EXISTS holdings (
+    occ_symbol   TEXT PRIMARY KEY,
+    underlying   TEXT NOT NULL,
+    opened_at    TEXT NOT NULL,
+    direction    TEXT NOT NULL,   -- up | down, the thesis being expressed
+    entry_spot   REAL NOT NULL,   -- the underlying's price when we bought
+    entry_premium REAL NOT NULL,
+    stop_spot    REAL NOT NULL,   -- underlying level that invalidates the thesis
+    target_spot  REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS decisions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     at          TEXT NOT NULL,
@@ -73,6 +93,37 @@ class Event:
 
 
 @dataclass(frozen=True, slots=True)
+class Holding:
+    """Where the underlying stood when a position was opened, and the levels
+    that decide its fate."""
+
+    occ_symbol: str
+    underlying: str
+    opened_at: str
+    direction: str
+    entry_spot: float
+    entry_premium: float
+    stop_spot: float
+    target_spot: float
+
+    def breached_stop(self, spot: float) -> bool:
+        """Whether the underlying has moved through the level that invalidates
+        the thesis. Direction decides which side counts as through."""
+        return spot <= self.stop_spot if self.direction == "up" else spot >= self.stop_spot
+
+    def reached_target(self, spot: float) -> bool:
+        return spot >= self.target_spot if self.direction == "up" else spot <= self.target_spot
+
+    def move_pct(self, spot: float) -> float:
+        """How far the underlying has travelled from entry, signed so that
+        positive always means 'in favour of the thesis'."""
+        if self.entry_spot <= 0:
+            return 0.0
+        raw = (spot - self.entry_spot) / self.entry_spot
+        return raw if self.direction == "up" else -raw
+
+
+@dataclass(frozen=True, slots=True)
 class DecisionRow:
     at: str
     underlying: str
@@ -87,8 +138,13 @@ class DecisionRow:
 class Journal:
     """Append-only log of everything the agent did and considered."""
 
-    def __init__(self, path: Path | str = Path("state/journal.db")) -> None:
-        self.path = Path(path)
+    def __init__(self, path: Path | str | None = None) -> None:
+        # Defaults to the active profile's own journal. Two accounts sharing one
+        # would produce a cooldown on the second because the first stopped out,
+        # and `holdings` rows keyed by contract symbol would collide the moment
+        # both bought the same option.
+        from agent import profile
+        self.path = Path(path) if path is not None else profile.journal_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
@@ -136,6 +192,44 @@ class Journal:
                  proposal.thinking_summary if proposal else None,
                  encoded),
             )
+
+    def open_holding(self, *, occ_symbol: str, underlying: str, direction: str,
+                     entry_spot: float, entry_premium: float,
+                     stop_spot: float, target_spot: float) -> None:
+        """Record where the underlying stood when a position was opened.
+
+        `REPLACE` rather than `INSERT` so a re-opened contract overwrites the
+        stale row instead of failing. The alternative -- a duplicate-key error
+        inside the trading loop -- would turn a harmless edge case into a failed
+        pass.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO holdings (occ_symbol, underlying, opened_at, "
+                "direction, entry_spot, entry_premium, stop_spot, target_spot) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (occ_symbol, underlying, datetime.now(UTC).isoformat(), direction,
+                 entry_spot, entry_premium, stop_spot, target_spot),
+            )
+
+    def close_holding(self, occ_symbol: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM holdings WHERE occ_symbol = ?", (occ_symbol,))
+
+    def holding(self, occ_symbol: str) -> Holding | None:
+        """The recorded entry conditions for one position, if we opened it.
+
+        Returns None for anything this agent did not open -- a position from an
+        earlier system, or one placed by hand. Those are not errors: the exit
+        logic falls back to a premium-based stop for them, which is the only
+        rule available when there is no entry level to reason from.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT occ_symbol, underlying, opened_at, direction, entry_spot, "
+                "entry_premium, stop_spot, target_spot FROM holdings "
+                "WHERE occ_symbol = ?", (occ_symbol,)).fetchone()
+        return Holding(**dict(row)) if row else None
 
     # -- reading -----------------------------------------------------------
 

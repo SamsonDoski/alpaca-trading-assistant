@@ -17,7 +17,7 @@ research project and are marked with what that measurement showed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import yaml
@@ -55,6 +55,25 @@ class Settings:
     # nothing: a skipped entry is free, because the next pass is 15 minutes away.
     min_confidence: float = 0.5
 
+    # --- Concentration ------------------------------------------------------
+    # Which symbols move together. Declared rather than computed: a rolling
+    # correlation matrix would be more precise and also unstable, expensive, and
+    # impossible to explain inside a one-line refusal.
+    #
+    # Empty by default so the cap is opt-in from config.yaml, where the universe
+    # that needs grouping is actually defined.
+    correlation_groups: dict[str, str] = field(default_factory=dict)
+
+    # Positions allowed in any one group. Every other gate reasons about a
+    # single trade; without this, eight slots could hold eight versions of the
+    # same bet -- one macro position with eight chances to be wrong together.
+    max_per_group: int = 3
+
+    # Positions allowed on the same side. Sector limits catch "all technology";
+    # this catches the subtler case of eight well-spread sectors that are all
+    # long calls, which is still a single bet on the market going up.
+    max_same_direction: int = 5
+
     # --- Contract selection -------------------------------------------------
     # Target slightly in the money. A contract near 0.65 delta moves about 65
     # cents per dollar of underlying, loses a small share of its premium to time
@@ -67,11 +86,67 @@ class Settings:
     dte_min: int = 30
     dte_max: int = 45
 
-    # Reject a contract quoting wider than this. Note the free market data tier
-    # provides Alpaca's *indicative* options feed, so this is measured against an
-    # estimated NBBO rather than full OPRA; the threshold is set loose enough
-    # that feed noise alone should not trip it.
-    max_spread_pct: float = 0.05
+    # Reject a contract quoting wider than this.
+    #
+    # This gate changed meaning once the feed was measured, and the change is
+    # worth being explicit about rather than hiding behind a number.
+    #
+    # At 5% it was a COST-OF-CROSSING rule, calibrated against real OPRA data:
+    # a position opened across a 5% spread starts 5% down, which is more than
+    # the edge on an average trade. That is the right rule and the right number
+    # -- against the right data.
+    #
+    # We do not have that data. The free Basic plan supplies Alpaca's INDICATIVE
+    # options feed, and measuring 44 symbols during market hours on 31 Aug 2026
+    # showed what that costs: MSFT quoted 12.5% wide and AAPL 12.7%, in the
+    # 30-45 day window at 0.65 delta. Those are two of the most liquid option
+    # markets in existence and genuinely trade near 1-2%. The number describes
+    # the feed, not the market.
+    #
+    # So at 0.15 this is no longer a cost rule. It is a SANITY rule: it rejects
+    # quotes that are broken rather than merely inflated -- the 34% and 37% ones
+    # where the feed has nothing real at all. The assumption it now rests on is
+    # that reported spreads on liquid names overstate the true spread by roughly
+    # an order of magnitude. That assumption is reasonable and it is not
+    # verified; if a reported spread is ever genuine, this gate will let us pay
+    # it. Gating on open interest instead would be feed-independent and is the
+    # better long-term fix.
+    max_spread_pct: float = 0.15
+
+    # --- What the premium costs ---------------------------------------------
+    # Reject a contract whose implied volatility exceeds the underlying's own
+    # realized volatility by more than this multiple.
+    #
+    # This is the gate the strategy was missing. Implied volatility is the PRICE
+    # of an option, and until now the system displayed it and acted on it not at
+    # all: SPY at 13% IV and SMCI at 70% went through identical machinery. For a
+    # premium buyer that is trading blind on the one number that decides whether
+    # the trade is cheap.
+    #
+    # 1.4 means: pay up to forty percent over what the stock has actually been
+    # doing, and refuse beyond that. Above roughly 1.5 the variance risk premium
+    # is large enough that a directionally correct trade can still lose, because
+    # implied volatility collapses toward realized once the event passes.
+    #
+    # Note what this is NOT: a true IV rank, comparing today's implied against
+    # its own history. That needs an IV time series per contract, and contracts
+    # expire and roll so the series is not continuous. IV against realized asks
+    # the same question with data already in hand and a clearer economic meaning.
+    max_iv_to_realized: float = 1.4
+
+    # Sessions of history used to measure the underlying's realized volatility.
+    # 20 is about a month of trading -- long enough to be a measurement rather
+    # than a reading of the last few days, short enough to reflect the regime
+    # the option is actually being priced in.
+    realized_vol_lookback: int = 20
+
+    # Refuse a contract that decays faster than this each day, as a fraction of
+    # the premium. 1.5% a day is roughly a fifth of the position over a two-week
+    # thesis -- gone before direction has had a chance to matter.
+    #
+    # Long premium is a race between the move and the clock. Nothing in this
+    # system could see the clock until now.
+    max_daily_decay: float = 0.015
 
     # --- Exits --------------------------------------------------------------
     # Options carry no broker-side trailing stop -- Alpaca supports trailing
@@ -84,6 +159,33 @@ class Settings:
     # separately, so the two cannot drift apart and silently move that number.
     stop_loss_pct: float = 0.25
     reward_to_risk: float = 2.0
+
+    # --- Where the stop actually sits ---------------------------------------
+    # The stop is keyed to the UNDERLYING, at this multiple of its average true
+    # range. Distance measured in the stock's own units, because a flat 3% is a
+    # meaningful move on a quiet name and pure noise on a volatile one -- and a
+    # stop inside the noise fires on days where nothing happened.
+    #
+    # 2.0 puts the stop roughly two typical days away: far enough that ordinary
+    # movement does not reach it, close enough that a real reversal does.
+    stop_atr_multiple: float = 2.0
+
+    # Used only when there is not enough history to measure a range.
+    fallback_stop_pct: float = 0.03
+
+    # The premium stop, demoted to a backstop and widened accordingly.
+    #
+    # It was the primary rule and should not have been. A 25% fall in a
+    # 0.65-delta option is under a 2% move in the underlying, so it fired on
+    # noise and on volatility crushes while the thesis was intact -- and fired
+    # hardest on exactly the high-volatility names where premium swings most,
+    # which is the opposite of what a risk rule should do.
+    #
+    # At 50% its job is different: catch an option that has been gutted by
+    # collapsing implied volatility even though the stock did nothing. That is a
+    # broken position, not a losing one, and it needs closing for a different
+    # reason.
+    premium_backstop_pct: float = 0.50
 
     # Close this many days before expiry regardless of P&L. Time decay
     # accelerates into the final week and the position stops behaving like the
@@ -98,6 +200,24 @@ class Settings:
     # because it tested better.
     risk_per_trade: float = 0.04
     max_contracts: int = 50
+
+    # --- Concurrency --------------------------------------------------------
+    # How many symbols are worked on at once.
+    #
+    # This exists because of an outage, not a theory. The first version fanned
+    # out every symbol simultaneously, which was fine at nine and killed the
+    # agent at thirty: nine symbols is 36 concurrent tool calls through a single
+    # stdio connection to the MCP server, and thirty is 120. From 14:30 ET on
+    # 31 Aug 2026 every pass died with "MCPError: Connection closed" -- taking
+    # the exit checks with it, so a position sat at -42% through a -25% stop for
+    # the last two hours of trading.
+    #
+    # The fix is a ceiling rather than a smaller watchlist. Six symbols at a
+    # time is roughly 24 concurrent reads, comfortably inside what the server
+    # handles, and a pass still finishes in a fraction of its fifteen minutes
+    # because the waiting still overlaps -- just in batches instead of all at
+    # once.
+    max_concurrent_symbols: int = 6
 
     # --- Execution ----------------------------------------------------------
     # 0 = bid, 1 = ask. Entries stay patient: a missed entry costs nothing since

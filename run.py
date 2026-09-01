@@ -4,6 +4,7 @@
     python run.py account             equity and buying power
     python run.py positions           what we currently hold
     python run.py chain AAPL          the tradable slice of one option chain
+    python run.py spreads V JPM UBER  measure liquidity before adding a symbol
     python run.py trade               one full pass (dry run unless --live)
     python run.py journal             what it did and declined today
     python run.py report              render it all as one HTML file
@@ -30,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from dotenv import load_dotenv  # noqa: E402
 
+from agent import profile  # noqa: E402
 from agent.market import MarketDataError, open_reader  # noqa: E402
 from agent.settings import load_settings  # noqa: E402
 
@@ -161,17 +163,17 @@ async def cmd_propose(args) -> int:
     brief, asks for a view, and prints what came back. Nothing is sized and
     nothing is ordered.
     """
-    import anthropic
-
-    from agent.market import build_brief
-    from agent.proposer import Proposer, render_brief
-
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print("\n  [stop] ANTHROPIC_API_KEY is not set in .env")
-        return 1
-
     from agent.entry import decide_entry
     from agent.gates import GateContext, screen
+    from agent.market import build_brief
+    from agent.models import ModelUnavailable, build_backend
+    from agent.proposer import Proposer, render_brief
+
+    try:
+        backend = build_backend()
+    except ModelUnavailable as exc:
+        print(f"\n  [stop] {exc}")
+        return 1
 
     settings = load_settings(args.config)
     symbol = args.symbol.upper()
@@ -212,9 +214,9 @@ async def cmd_propose(args) -> int:
 
     print(f"\n  {len(brief.bars)} daily bars, {len(brief.candidates)} contracts in range, "
           f"{len(brief.headlines)} headlines")
-    print("  asking Claude...\n")
+    print(f"  asking {backend.name}...\n")
 
-    proposal = Proposer(anthropic.Anthropic()).propose(brief)
+    proposal = Proposer(backend).propose(brief)
 
     if proposal.thinking_summary:
         print("  REASONING")
@@ -269,16 +271,17 @@ async def cmd_trade(args) -> int:
     This is what the schedule runs. Everything it needs is constructed here and
     handed to `run_pass`, which owns only the order things happen in.
     """
-    import anthropic
-
     from agent.executor import CliExecutor
     from agent.journal import Journal
     from agent.loop import run_pass
+    from agent.models import ModelUnavailable, build_backend
     from agent.notify import Notifier
     from agent.proposer import Proposer
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print("  [stop] ANTHROPIC_API_KEY is not set in .env")
+    try:
+        backend = build_backend()
+    except ModelUnavailable as exc:
+        print(f"  [stop] {exc}")
         return 1
 
     settings = load_settings(args.config)
@@ -287,21 +290,29 @@ async def cmd_trade(args) -> int:
     journal = Journal()
 
     mode = "LIVE on the paper account" if args.live else "DRY RUN -- nothing will be sent"
-    print(f"\n  {mode}")
+    # The profile is named on every pass. With two accounts running from one
+    # copy of the code, a log line that does not say which account it belongs to
+    # is a log line you cannot act on.
+    print(f"\n  {mode}  [profile: {profile.label()}]")
     print(f"  {len(settings.symbols)} symbols, "
           f"{settings.stop_loss_pct:.0%} stop / {settings.take_profit_pct:.0%} target "
           f"({settings.break_even_win_rate:.0%} break-even win rate)")
+    print(f"  model: {backend.name}")
 
     async with open_reader() as reader:
         result = await run_pass(
             reader,
             settings=settings,
             executor=executor,
-            proposer=Proposer(anthropic.Anthropic()),
+            proposer=Proposer(backend),
             journal=journal,
             notifier=notifier,
             ignore_clock=args.ignore_clock,
             trading_halted=os.getenv("TRADING_HALTED", "").lower() in ("true", "1", "yes"),
+            # Same backend for selection. A different one would be defensible --
+            # ranking is a cheaper question than analysis -- but two providers
+            # means two failure modes for one pass.
+            selector_backend=backend,
         )
 
     print(f"\n  {result.skipped_before_model} screened out before any model call")
@@ -363,6 +374,126 @@ async def cmd_journal(args) -> int:
     return 0
 
 
+async def cmd_spreads(args) -> int:
+    """Measure the tradable slice of several chains at once.
+
+    Answers the only question that matters before adding a name to the
+    watchlist: are its contracts liquid enough to trade? A symbol whose quotes
+    are consistently wider than max_spread_pct will be refused on every pass
+    forever, costing a model call each time and never producing a trade.
+
+    Reports the median spread rather than the mean, because one untraded strike
+    quoting 300% wide would drag a mean into nonsense while telling you nothing
+    about the contracts you would actually buy.
+    """
+    from statistics import median
+
+    from agent.pricing import daily_decay_pct, premium_richness, realized_volatility
+
+    settings = load_settings(args.config)
+    today = date.today()
+    symbols = ([s.strip().upper() for s in args.symbols]
+               if args.symbols else list(settings.symbols))
+
+    print(f"\n  Measuring {len(symbols)} symbols, {settings.dte_min}-{settings.dte_max} "
+          f"days out, delta {settings.delta_min:.2f}-{settings.delta_max:.2f}")
+    print(f"  Limits: spread {settings.max_spread_pct:.0%}, "
+          f"IV/realized {settings.max_iv_to_realized:.2f}x, "
+          f"decay {settings.max_daily_decay:.2%}/day\n")
+
+    async def measure(symbol: str):
+        chain, bars = await asyncio.gather(
+            reader.option_chain(symbol, right="call", dte_min=settings.dte_min,
+                                dte_max=settings.dte_max),
+            reader.recent_bars(symbol),
+            return_exceptions=True,
+        )
+        return chain, bars
+
+    async with open_reader() as reader:
+        # Bounded, for the same reason the trading loop is: an unbounded fan-out
+        # over thirty symbols is what killed the MCP connection once already.
+        gate = asyncio.Semaphore(settings.max_concurrent_symbols)
+
+        async def one(symbol: str):
+            async with gate:
+                return await measure(symbol)
+
+        results = await asyncio.gather(*(one(s) for s in symbols),
+                                       return_exceptions=True)
+
+    print(f"    {'symbol':<8}{'band':>6}{'spread':>8}{'RV':>7}{'IV':>7}"
+          f"{'IV/RV':>7}{'decay':>8}{'cost':>9}   verdict")
+    print("    " + "-" * 76)
+
+    rows = []
+    for symbol, result in zip(symbols, results, strict=True):
+        if isinstance(result, BaseException):
+            rows.append((symbol, 0, 1.0, None, None, None, None, 0.0))
+            continue
+        chain, bars = result
+        chain = chain if isinstance(chain, list) else []
+        bars = bars if isinstance(bars, list) else []
+
+        band = [c for c in chain
+                if settings.delta_min <= c.abs_delta <= settings.delta_max and c.bid > 0]
+        if not band:
+            rows.append((symbol, 0, 1.0, None, None, None, None, 0.0))
+            continue
+
+        spot = bars[-1].close if bars else 0.0
+        rv = realized_volatility(bars, settings.realized_vol_lookback)
+        spread = median(c.spread_pct for c in band)
+
+        ivs = [float(c.implied_volatility) for c in band if c.implied_volatility]
+        iv = median(ivs) if ivs else None
+        richness = premium_richness(iv, rv)
+
+        decays = [d for d in (daily_decay_pct(c, spot, today) for c in band)
+                  if d is not None]
+        decay = median(decays) if decays else None
+
+        cheapest = min(band, key=lambda c: c.cost_per_contract)
+        rows.append((symbol, len(band), spread, rv, iv, richness, decay,
+                     cheapest.cost_per_contract))
+
+    def verdict_for(count, spread, richness, decay) -> str:
+        """Named for the first limit it fails, because that is the actionable
+        fact -- a symbol refused for a wide spread needs a different response
+        from one refused for an expensive premium."""
+        if count == 0:
+            return "no contracts in band"
+        if spread > settings.max_spread_pct:
+            return "spread too wide"
+        if richness is None or decay is None:
+            return "cannot price the premium"
+        if richness > settings.max_iv_to_realized:
+            return f"premium rich ({richness:.2f}x realized)"
+        if decay > settings.max_daily_decay:
+            return f"decays too fast ({decay * 14:.0%} in two weeks)"
+        return "TRADABLE"
+
+    def show(value, fmt: str) -> str:
+        return format(value, fmt) if value is not None else "  --  "
+
+    passing = 0
+    for row in sorted(rows, key=lambda r: (r[1] == 0, r[2])):
+        symbol, count, spread, rv, iv, richness, decay, cost = row
+        verdict = verdict_for(count, spread, richness, decay)
+        if verdict == "TRADABLE":
+            passing += 1
+        print(f"    {symbol:<8}{count:>6}{spread:>8.1%}{show(rv, '>7.0%')}"
+              f"{show(iv, '>7.0%')}{show(richness, '>7.2f')}"
+              f"{show(decay, '>8.2%')}{cost:>9,.0f}   {verdict}")
+
+    print(f"\n    {passing} of {len(symbols)} pass every gate.")
+    print("    RV is the underlying's own realized volatility; IV/RV above "
+          f"{settings.max_iv_to_realized:.2f} means")
+    print("    you are paying for movement the stock has not been delivering.")
+    print("    Measure during market hours -- quotes widen when the market is shut.")
+    return 0
+
+
 async def cmd_report(args) -> int:
     """Render the journal as a single self-contained HTML file."""
     from agent.journal import Journal
@@ -398,7 +529,9 @@ async def cmd_raw(args) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", default="config.yaml")
+    # Defaults to the active profile's config, which falls back to the shared
+    # one when the profile has no override of its own.
+    parser.add_argument("--config", default=None)
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("tools", help="list the MCP server's tools").set_defaults(func=cmd_tools)
@@ -437,6 +570,11 @@ def main() -> int:
     jrnl.add_argument("--limit", type=int, default=30)
     jrnl.set_defaults(func=cmd_journal)
 
+    spreads = sub.add_parser("spreads", help="measure option liquidity across symbols")
+    spreads.add_argument("symbols", nargs="*",
+                         help="symbols to measure (default: the configured watchlist)")
+    spreads.set_defaults(func=cmd_spreads)
+
     report = sub.add_parser("report", help="render the journal as one HTML file")
     report.add_argument("--output", default="state/report.html")
     report.add_argument("--offline", action="store_true",
@@ -452,7 +590,11 @@ def main() -> int:
     raw.set_defaults(func=cmd_raw)
 
     args = parser.parse_args()
-    load_dotenv()
+    if args.config is None:
+        args.config = str(profile.config_file())
+    # The profile's own .env, so a second account's credentials never depend on
+    # which directory the command happened to run from.
+    load_dotenv(profile.env_file())
 
     try:
         return asyncio.run(args.func(args))

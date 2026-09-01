@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from agent.domain import Direction, MarketBrief, OptionContract, OrderDraft, Proposal
 from agent.gates import GateContext, GateOutcome, authorise
+from agent.pricing import realized_volatility
 from agent.settings import Settings
 
 
@@ -131,6 +132,10 @@ def decide_entry(proposal: Proposal, brief: MarketBrief, ctx: GateContext) -> Ga
         # the single authority on how much the account can actually take.
         quantity=settings.max_contracts,
         limit_price=limit_price(contract, settings.entry_aggression),
+        # The price gates need the underlying's scale and its own volatility.
+        # Both come off the brief, so the gates never fetch anything.
+        spot=brief.spot,
+        realized_vol=realized_volatility(brief.bars, settings.realized_vol_lookback),
     )
 
     return authorise(draft, ctx)

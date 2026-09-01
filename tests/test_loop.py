@@ -16,6 +16,7 @@ from datetime import date, timedelta
 import pytest
 
 from agent.domain import (
+    PriceBar,
     AccountState,
     Direction,
     MarketBrief,
@@ -43,7 +44,16 @@ def position(underlying="AAPL", *, quantity=2, entry=15.80, current=15.80,
 
 def contract(underlying="AAPL") -> OptionContract:
     return OptionContract(f"{underlying}261016C00310000", underlying, "call", 310.0,
-                          EXPIRY, 15.50, 16.00, 0.65, 0.30, 900)
+                          EXPIRY, 15.50, 16.00, 0.65, 0.20, 900)
+
+
+def bars_with_volatility(count: int = 25) -> list[PriceBar]:
+    """Alternating closes, so realized volatility is real and known."""
+    return [
+        PriceBar(day=date(2026, 8, 1), open=310.0, high=314.0, low=309.0,
+                 close=(313.0 if i % 2 else 310.0), volume=1_000_000)
+        for i in range(count)
+    ]
 
 
 # --- Exit rules ------------------------------------------------------------
@@ -150,12 +160,13 @@ def test_realised_and_lifetime_totals_add_up(journal):
 
 class FakeReader:
     def __init__(self, *, positions=(), equity=100_000, is_open=True,
-                 candidates=None, fail_account=False):
+                 candidates=None, fail_account=False, spot=313.0):
         self._positions = tuple(positions)
         self._equity = equity
         self._is_open = is_open
         self._candidates = candidates if candidates is not None else (contract(),)
         self._fail_account = fail_account
+        self._spot = spot
         self.reads = 0
 
     async def account(self):
@@ -173,8 +184,11 @@ class FakeReader:
     async def option_quote(self, occ_symbol):
         return (11.90, 12.10)
 
+    async def stock_price(self, symbol):
+        return self._spot
+
     async def recent_bars(self, symbol, days=120):
-        return []
+        return bars_with_volatility()
 
     async def option_chain(self, underlying, **kwargs):
         return [c for c in self._candidates if c.underlying == underlying]
@@ -186,9 +200,16 @@ class FakeReader:
 class FakeExecutor:
     is_dry_run = True
 
-    def __init__(self, *, fail_open=False):
+    def __init__(self, *, fail_open=False, resting=(), fail_orders=False):
         self.actions: list[tuple[str, str]] = []
         self._fail_open = fail_open
+        self._resting = list(resting)
+        self._fail_orders = fail_orders
+
+    def open_orders(self):
+        if self._fail_orders:
+            raise ExecutionError("broker unreachable")
+        return [{"symbol": s} for s in self._resting]
 
     def _receipt(self, symbol, qty):
         return OrderReceipt("ata-x", symbol, qty, None, status="validated", dry_run=True)
@@ -360,6 +381,199 @@ def test_the_pass_always_ends_with_a_summary(journal):
     notifier = RecordingNotifier()
     run(FakeReader(), FakeExecutor(), FakeProposer({}), journal, notifier)
     assert notifier.calls[-1] == "summary"
+
+
+def test_a_resting_order_stops_a_duplicate_on_the_same_name(journal):
+    """Found live: four unfilled limit orders, and gates that only counted
+    filled positions were still willing to place four more."""
+    executor = FakeExecutor(resting=["AAPL261016C00310000"])
+    settings = Settings(symbols=("AAPL", "MSFT"))
+    asyncio.run(run_pass(
+        FakeReader(candidates=(contract("AAPL"), contract("MSFT"))),
+        settings=settings, executor=executor,
+        proposer=FakeProposer({"AAPL": (0.9, Direction.UP),
+                               "MSFT": (0.9, Direction.UP)}),
+        journal=journal, notifier=RecordingNotifier(), today=TODAY))
+
+    bought = [symbol for action, symbol in executor.actions if action == "buy"]
+    assert not any("AAPL" in s for s in bought)
+    assert any("MSFT" in s for s in bought)
+
+
+def test_an_unreadable_order_book_skips_entries_rather_than_risking_duplicates(journal):
+    """Missing a pass costs one opportunity. A second order on a name that
+    already has one costs money if the price moves through both."""
+    executor = FakeExecutor(fail_orders=True)
+    notifier = RecordingNotifier()
+    result = run(FakeReader(), executor,
+                 FakeProposer({"AAPL": (0.9, Direction.UP)}), journal, notifier)
+    assert not any(action == "buy" for action, _ in executor.actions)
+    assert result.errors
+    assert "alert" in notifier.calls
+
+
+def test_exits_still_run_when_the_order_book_cannot_be_read(journal):
+    """Entries stop; exits must not."""
+    stopped = position("AAPL", entry=20.00, current=15.00)
+    executor = FakeExecutor(fail_orders=True)
+    run(FakeReader(positions=(stopped,)), executor, FakeProposer({}), journal,
+        RecordingNotifier())
+    assert any(action.startswith("sell") for action, _ in executor.actions)
+
+
+def test_symbol_work_is_bounded_rather_than_fanned_out(journal):
+    """Unlimited fan-out killed the agent: thirty symbols at four reads each is
+    120 concurrent calls through one stdio connection, the MCP server closed it,
+    and eight consecutive passes died before reaching their own stop checks."""
+    peak = 0
+    live = 0
+
+    class CountingReader(FakeReader):
+        async def option_chain(self, underlying, **kwargs):
+            nonlocal peak, live
+            live += 1
+            peak = max(peak, live)
+            await asyncio.sleep(0)
+            live -= 1
+            return [c for c in self._candidates if c.underlying == underlying]
+
+    symbols = tuple(f"SYM{i}" for i in range(20))
+    settings = Settings(symbols=symbols, max_concurrent_symbols=3)
+    asyncio.run(run_pass(
+        CountingReader(), settings=settings, executor=FakeExecutor(),
+        proposer=FakeProposer({}), journal=journal,
+        notifier=RecordingNotifier(), today=TODAY))
+
+    # Two chain reads per symbol (calls and puts), three symbols at a time.
+    assert peak <= 6, f"{peak} concurrent reads; the ceiling was meant to be 6"
+
+
+def test_a_higher_ceiling_allows_more_at_once(journal):
+    """The bound is a real setting, not a hardcoded serialisation."""
+    peak = 0
+    live = 0
+
+    class CountingReader(FakeReader):
+        async def option_chain(self, underlying, **kwargs):
+            nonlocal peak, live
+            live += 1
+            peak = max(peak, live)
+            await asyncio.sleep(0)
+            live -= 1
+            return []
+
+    settings = Settings(symbols=tuple(f"S{i}" for i in range(20)),
+                        max_concurrent_symbols=10)
+    asyncio.run(run_pass(
+        CountingReader(), settings=settings, executor=FakeExecutor(),
+        proposer=FakeProposer({}), journal=journal,
+        notifier=RecordingNotifier(), today=TODAY))
+    assert peak > 6
+
+
+# --- Underlying-keyed stops -----------------------------------------------
+#
+# The change these cover: a 25% fall in a 0.65-delta option is under a 2% move
+# in the stock. Keying the stop to premium fires on noise and on volatility
+# crushes while the thesis is intact -- and fires hardest on exactly the
+# high-volatility names where premium swings most.
+
+def test_opening_a_position_records_where_the_underlying_stood(journal):
+    executor = FakeExecutor()
+    run(FakeReader(candidates=(contract("AAPL"),)), executor,
+        FakeProposer({"AAPL": (0.9, Direction.UP)}), journal, RecordingNotifier())
+
+    held = journal.holding("AAPL261016C00310000")
+    assert held is not None
+    # Whatever the brief's last close was -- asserted against the fixture rather
+    # than a literal, so the test stays true if the bar series changes.
+    assert held.entry_spot == pytest.approx(bars_with_volatility()[-1].close)
+    assert held.stop_spot < held.entry_spot < held.target_spot
+
+
+def test_the_stop_sits_below_entry_for_a_call_and_above_for_a_put():
+    from agent.exits import stop_and_target
+    settings = Settings()
+    up_stop, up_target = stop_and_target(100.0, "up", atr_pct=0.02, settings=settings)
+    down_stop, down_target = stop_and_target(100.0, "down", atr_pct=0.02,
+                                             settings=settings)
+    assert up_stop < 100.0 < up_target
+    assert down_target < 100.0 < down_stop
+
+
+def test_a_volatile_stock_gets_a_wider_stop():
+    """Distance measured in the stock's own units. A flat 3% is a real move on
+    a quiet name and pure noise on a wild one."""
+    from agent.exits import stop_and_target
+    calm, _ = stop_and_target(100.0, "up", atr_pct=0.01, settings=Settings())
+    wild, _ = stop_and_target(100.0, "up", atr_pct=0.05, settings=Settings())
+    assert wild < calm
+
+
+def test_the_underlying_moving_through_the_stop_closes_the_position(journal):
+    from agent.exits import ExitReason, check_exit
+    from agent.journal import Holding
+    holding = Holding("AAPL261016C00310000", "AAPL", "2026-09-04T00:00:00",
+                      "up", 313.0, 15.75, stop_spot=300.0, target_spot=340.0)
+    # Premium only down 10%, nowhere near the old 25% rule -- but the stock has
+    # gone through the level that says the thesis was wrong.
+    held = position("AAPL", entry=15.75, current=14.20)
+    decision = check_exit(held, SETTINGS, TODAY, holding=holding, spot=298.0)
+    assert decision is not None and decision.reason is ExitReason.STOP_LOSS
+    assert "against the thesis" in decision.detail
+
+
+def test_premium_noise_no_longer_stops_out_a_live_thesis(journal):
+    """The whole point. Down 30% on premium, but the stock has barely moved and
+    has not reached the level that would say we were wrong."""
+    from agent.exits import check_exit
+    from agent.journal import Holding
+    holding = Holding("AAPL261016C00310000", "AAPL", "2026-09-04T00:00:00",
+                      "up", 313.0, 15.75, stop_spot=300.0, target_spot=340.0)
+    held = position("AAPL", entry=15.75, current=11.00)      # -30% premium
+    assert check_exit(held, SETTINGS, TODAY, holding=holding, spot=311.0) is None
+
+
+def test_a_collapsed_premium_still_closes_through_the_backstop():
+    """The case the underlying cannot see: implied volatility gutting the option
+    while the stock does nothing."""
+    from agent.exits import ExitReason, check_exit
+    from agent.journal import Holding
+    holding = Holding("AAPL261016C00310000", "AAPL", "2026-09-04T00:00:00",
+                      "up", 313.0, 15.75, stop_spot=300.0, target_spot=340.0)
+    held = position("AAPL", entry=15.75, current=7.00)       # -56% premium
+    decision = check_exit(held, SETTINGS, TODAY, holding=holding, spot=312.0)
+    assert decision is not None
+    assert decision.reason is ExitReason.PREMIUM_BACKSTOP
+    assert "collapsed, not the thesis" in decision.detail
+
+
+def test_a_backstop_close_starts_no_cooldown(journal):
+    """Nothing was disproved, so there is nothing to cool off from."""
+    journal.record("closed", "AAPL", "AAPL261016C00310000",
+                   "premium backstop -- the option collapsed", pnl=-800)
+    assert journal.cooling_off(within_days=2) == {}
+
+
+def test_a_position_we_did_not_open_falls_back_to_the_premium_stop():
+    """Positions from an earlier system have no recorded entry level. Pretending
+    otherwise would leave them silently unmanaged."""
+    from agent.exits import ExitReason, check_exit
+    held = position("AAPL", entry=20.00, current=15.00)      # -25%
+    decision = check_exit(held, SETTINGS, TODAY, holding=None, spot=300.0)
+    assert decision is not None and decision.reason is ExitReason.STOP_LOSS
+    assert "no entry level recorded" in decision.detail
+
+
+def test_closing_a_position_clears_its_recorded_levels(journal):
+    """A stale row would let a later re-entry inherit levels computed for a
+    different trade."""
+    journal.open_holding(occ_symbol="X261016C00310000", underlying="AAPL",
+                         direction="up", entry_spot=313.0, entry_premium=15.0,
+                         stop_spot=300.0, target_spot=340.0)
+    assert journal.holding("X261016C00310000") is not None
+    journal.close_holding("X261016C00310000")
+    assert journal.holding("X261016C00310000") is None
 
 
 def test_the_summary_reports_refusals(journal):

@@ -43,6 +43,7 @@ from enum import Enum
 from typing import Protocol
 
 from agent.domain import AccountState, OpenPosition, OrderDraft
+from agent.pricing import daily_decay_pct, premium_richness
 from agent.settings import Settings
 
 
@@ -96,10 +97,22 @@ class GateContext:
     open_positions: tuple[OpenPosition, ...] = ()
     # Underlying -> days still remaining on its post-stop-loss cooldown.
     cooling_off: dict[str, int] = field(default_factory=dict)
+    # Underlyings with an order resting at the broker that has not filled yet.
+    pending: frozenset[str] = frozenset()
     settings: Settings = field(default_factory=Settings)
 
     def holds(self, underlying: str) -> bool:
         return any(p.underlying == underlying for p in self.open_positions)
+
+    @property
+    def committed_slots(self) -> int:
+        """Positions plus resting orders.
+
+        An unfilled order is a slot we have already spent, even though nothing
+        is held yet. Counting only positions is how the account ends up with
+        more exposure than max_positions allows -- see PositionSlots.
+        """
+        return len(self.open_positions) + len(self.pending)
 
     @property
     def committed(self) -> float:
@@ -168,10 +181,54 @@ class PositionSlots:
     name: str = "position_slots"
 
     def check(self, underlying: str, ctx: GateContext) -> Verdict:
-        used = len(ctx.open_positions)
+        # Resting orders count. A limit order that has not filled has still
+        # spent a slot and reserved the cash behind it, and on a feed where
+        # fills are slow that gap can stay open for hours. Counting only
+        # filled positions let a live run place four orders and then remain
+        # willing to place four more.
+        used = ctx.committed_slots
         limit = ctx.settings.max_positions
         if used >= limit:
-            return Verdict.deny(f"all {limit} position slots are in use")
+            held, resting = len(ctx.open_positions), len(ctx.pending)
+            detail = f"{held} held" + (f" plus {resting} resting" if resting else "")
+            return Verdict.deny(f"all {limit} position slots are in use ({detail})")
+        return Verdict.allow()
+
+
+@dataclass(frozen=True, slots=True)
+class SectorConcentration:
+    """Caps how many positions may sit in one correlated group.
+
+    The hole this closes: every other gate reasons about ONE trade. Position
+    slots counted eight, the risk budget sized each at 4%, and nothing anywhere
+    asked whether the eight were secretly the same bet. Eight long calls on
+    mega-cap technology is not a diversified book -- it is one macro position
+    with eight commission charges and eight chances to be wrong together.
+
+    Grouping is declared rather than computed. A rolling correlation matrix over
+    daily returns would be more precise and would also be unstable, expensive,
+    and impossible to explain to anyone reading a refusal. "Three tech names is
+    enough tech" is a rule a person can check.
+    """
+
+    name: str = "sector_concentration"
+
+    def check(self, underlying: str, ctx: GateContext) -> Verdict:
+        groups = ctx.settings.correlation_groups
+        group = groups.get(underlying)
+        if group is None:
+            # Ungrouped names are treated as their own group of one, so an
+            # unclassified symbol can never quietly bypass the cap.
+            return Verdict.allow()
+
+        held = sum(1 for p in ctx.open_positions if groups.get(p.underlying) == group)
+        limit = ctx.settings.max_per_group
+        if held >= limit:
+            names = ", ".join(sorted(p.underlying for p in ctx.open_positions
+                                     if groups.get(p.underlying) == group))
+            return Verdict.deny(
+                f"already holding {held} position(s) in '{group}' ({names}), "
+                f"at the limit of {limit}")
         return Verdict.allow()
 
 
@@ -210,6 +267,12 @@ class NotAlreadyHeld:
     def check(self, underlying: str, ctx: GateContext) -> Verdict:
         if ctx.holds(underlying):
             return Verdict.deny("already holding a position in this underlying")
+        # An unfilled order is an intention to hold. Without this, a limit that
+        # sits unfilled for an hour invites a fresh order on the same name every
+        # fifteen minutes -- and if the price then moves through all of them at
+        # once, every one fills.
+        if underlying in ctx.pending:
+            return Verdict.deny("an order in this underlying is already resting unfilled")
         return Verdict.allow()
 
 
@@ -316,6 +379,95 @@ class ExpiryWindow:
 
 
 @dataclass(frozen=True, slots=True)
+class DirectionalBalance:
+    """Caps how far the whole book may lean one way.
+
+    Sector grouping catches "all technology". This catches the subtler version:
+    eight positions across eight unrelated sectors that are all long calls are
+    still one bet, on the market going up. In a broad selloff they lose together
+    regardless of how carefully the sectors were spread.
+
+    Runs as an ORDER gate rather than an entry gate because direction is the
+    model's answer, and the model has not answered yet when the entry screen
+    runs.
+    """
+
+    name: str = "directional_balance"
+
+    def check(self, draft: OrderDraft, ctx: GateContext) -> Verdict:
+        right = draft.contract.right
+        same = sum(1 for p in ctx.open_positions if p.right == right)
+        limit = ctx.settings.max_same_direction
+
+        if same >= limit:
+            leaning = "bullish" if right == "call" else "bearish"
+            return Verdict.deny(
+                f"the book already holds {same} {right} position(s) -- at the "
+                f"{limit} limit on how far it may lean {leaning}")
+        return Verdict.allow()
+
+
+@dataclass(frozen=True, slots=True)
+class PremiumRichness:
+    """Refuses options priced for more movement than the stock actually delivers.
+
+    The gate this strategy was missing. Implied volatility is the price of an
+    option, and a directional bet bought at rich implied volatility can be right
+    about direction and still lose, because implied collapses toward realized
+    once whatever was being priced in passes.
+
+    Needs the underlying's realized volatility, which arrives on the draft's
+    brief. When it cannot be computed -- too little history -- the gate refuses
+    rather than waves the trade through. An unmeasurable price is not a cheap
+    one, and this system's convention throughout is that missing data blocks
+    rather than permits.
+    """
+
+    name: str = "premium_richness"
+
+    def check(self, draft: OrderDraft, ctx: GateContext) -> Verdict:
+        richness = premium_richness(draft.contract.implied_volatility,
+                                    draft.realized_vol)
+        if richness is None:
+            return Verdict.deny(
+                "cannot price the premium: implied or realized volatility unavailable")
+
+        limit = ctx.settings.max_iv_to_realized
+        if richness > limit:
+            return Verdict.deny(
+                f"implied volatility is {richness:.2f}x realized, above the "
+                f"{limit:.2f}x limit -- the premium is rich")
+        return Verdict.allow()
+
+
+@dataclass(frozen=True, slots=True)
+class DecayBurden:
+    """Refuses options that bleed faster than a thesis can reasonably work.
+
+    Long premium is a race between the move and the clock, and until this gate
+    existed the system could not see the clock at all. A contract losing 2% of
+    its value a day gives a two-week thesis a 28% hole to climb out of before
+    direction has earned anything.
+    """
+
+    name: str = "decay_burden"
+
+    def check(self, draft: OrderDraft, ctx: GateContext) -> Verdict:
+        decay = daily_decay_pct(draft.contract, draft.spot, ctx.today)
+        if decay is None:
+            return Verdict.deny("cannot compute time decay for this contract")
+
+        limit = ctx.settings.max_daily_decay
+        if decay > limit:
+            # Stated as a two-week total as well, because a daily percentage is
+            # hard to feel and the cumulative number is the one that matters.
+            return Verdict.deny(
+                f"decays {decay:.2%} per day ({decay * 14:.0%} over two weeks), "
+                f"above the {limit:.2%} daily limit")
+        return Verdict.allow()
+
+
+@dataclass(frozen=True, slots=True)
 class RiskBudget:
     """Caps one trade at its share of equity, shrinking rather than refusing.
 
@@ -413,15 +565,23 @@ ENTRY_GATES: tuple[EntryGate, ...] = (
     KillSwitch(),
     MarketOpen(),
     PositionSlots(),
+    SectorConcentration(),
     Cooldown(),
     NotAlreadyHeld(),
 )
 
 ORDER_GATES: tuple[OrderGate, ...] = (
     MinimumConfidence(),
+    DirectionalBalance(),
     DeltaBand(),
     SpreadWidth(),
     ExpiryWindow(),
+    # The two price gates sit here deliberately: after the structural checks
+    # that decide whether this is the right CONTRACT, and before the sizing
+    # gates that decide how much of it. A contract that is the right shape but
+    # the wrong price should be refused before anyone works out how many to buy.
+    PremiumRichness(),
+    DecayBurden(),
     RiskBudget(),
     BuyingPower(),
 )

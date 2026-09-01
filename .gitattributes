@@ -1,0 +1,18 @@
+# Line endings are normalised to LF everywhere, and the shell scripts are the
+# reason it matters rather than a style preference.
+#
+# This repository is edited on Windows and deployed to Linux. Git's default
+# behaviour there is to check files out with CRLF, and a CRLF shell script does
+# not run: bash reports "syntax error near unexpected token" on the first
+# `case` or `if` it reaches. That already happened once during development, and
+# on a machine holding a live schedule it would mean every pass failing at
+# startup.
+#
+# Python tolerates CRLF, so the risk is confined to deploy/, but normalising
+# everything is simpler than remembering which files are load-bearing.
+* text=auto eol=lf
+
+# Explicit for the ones that would actually break.
+*.sh text eol=lf
+*.yaml text eol=lf
+*.example text eol=lf

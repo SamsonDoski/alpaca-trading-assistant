@@ -24,6 +24,7 @@ from datetime import date
 from enum import Enum
 
 from agent.domain import OpenPosition
+from agent.journal import Holding
 from agent.settings import Settings
 
 
@@ -31,6 +32,11 @@ class ExitReason(str, Enum):
     STOP_LOSS = "stop loss"
     TAKE_PROFIT = "take profit"
     EXPIRY = "expiry approaching"
+    # A premium collapse with the underlying thesis still intact -- usually a
+    # volatility crush. Kept separate from STOP_LOSS because it means something
+    # different and, unlike a real stop, does not start a cooldown: the thesis
+    # was never disproved, so there is nothing to cool off from.
+    PREMIUM_BACKSTOP = "premium backstop"
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,17 +62,31 @@ class ExitDecision:
         favour, so waiting for a better fill costs nothing worse than a smaller
         gain, and there is no runaway to outrun.
         """
-        return self.reason is ExitReason.STOP_LOSS
+        return self.reason in (ExitReason.STOP_LOSS, ExitReason.PREMIUM_BACKSTOP)
 
 
-def check_exit(position: OpenPosition, settings: Settings,
-               today: date) -> ExitDecision | None:
+def check_exit(position: OpenPosition, settings: Settings, today: date,
+               *, holding: Holding | None = None,
+               spot: float | None = None) -> ExitDecision | None:
     """Whether this position should be closed now.
 
-    Checked in order of consequence. Expiry comes first because it is the only
-    condition that is certain -- a contract in its final week stops behaving
-    like the directional bet it was opened as regardless of where the price is,
-    and time decay accelerates whether the trade is winning or losing.
+    **The stop is keyed to the underlying, not the premium, and that is the
+    substantive change.** A 25% fall in a 0.65-delta option is under a 2% move
+    in the stock -- comfortably inside a normal day -- so a premium-keyed stop
+    fires on noise and on volatility crushes while the directional thesis is
+    completely intact. Worse, it fires *most often* on exactly the high-volatility
+    names where the premium swings hardest, which is the opposite of a risk rule.
+
+    So the primary rule asks the only question that matters: has the underlying
+    moved through the level that says we were wrong?
+
+    The premium rule survives as a BACKSTOP at a much wider level. It catches the
+    case the underlying cannot see -- implied volatility collapsing so far that
+    the option is worthless even though the stock did nothing.
+
+    Falls back to the old premium-only behaviour when there is no recorded entry
+    level. That happens for positions this agent did not open, and pretending
+    otherwise would silently leave them unmanaged.
     """
     days = position.days_to_expiry(today)
     if days is not None and days <= settings.close_before_expiry:
@@ -77,17 +97,69 @@ def check_exit(position: OpenPosition, settings: Settings,
 
     ret = position.return_pct
 
-    if ret <= -settings.stop_loss_pct:
+    # No entry level recorded: this is not ours, or predates the holdings table.
+    # The premium stop is the only rule available, so it stays primary here.
+    if holding is None or spot is None or spot <= 0:
+        if ret <= -settings.stop_loss_pct:
+            return ExitDecision(
+                position, ExitReason.STOP_LOSS,
+                f"down {ret:.1%}, past the {settings.stop_loss_pct:.0%} stop "
+                f"(no entry level recorded, so keyed to premium)")
+        if ret >= settings.take_profit_pct:
+            return ExitDecision(
+                position, ExitReason.TAKE_PROFIT,
+                f"up {ret:.1%}, at the {settings.take_profit_pct:.0%} target")
+        return None
+
+    move = holding.move_pct(spot)
+
+    if holding.breached_stop(spot):
         return ExitDecision(
             position, ExitReason.STOP_LOSS,
-            f"down {ret:.1%}, past the {settings.stop_loss_pct:.0%} stop")
+            f"{position.underlying} moved {move:+.1%} against the thesis "
+            f"(through {holding.stop_spot:,.2f} from {holding.entry_spot:,.2f}); "
+            f"premium {ret:+.1%}")
 
-    if ret >= settings.take_profit_pct:
+    if holding.reached_target(spot):
         return ExitDecision(
             position, ExitReason.TAKE_PROFIT,
-            f"up {ret:.1%}, at the {settings.take_profit_pct:.0%} target")
+            f"{position.underlying} moved {move:+.1%} in favour "
+            f"(through {holding.target_spot:,.2f}); premium {ret:+.1%}")
+
+    # The thesis is alive but the option has been gutted anyway -- almost always
+    # implied volatility collapsing. Set far wider than the real stop, because
+    # its job is to catch a broken position rather than to manage a live one.
+    if ret <= -settings.premium_backstop_pct:
+        return ExitDecision(
+            position, ExitReason.PREMIUM_BACKSTOP,
+            f"premium down {ret:.1%} past the {settings.premium_backstop_pct:.0%} "
+            f"backstop while {position.underlying} is only {move:+.1%} from entry "
+            f"-- the option collapsed, not the thesis")
 
     return None
+
+
+def stop_and_target(spot: float, direction: str, *, atr_pct: float | None,
+                    settings: Settings) -> tuple[float, float]:
+    """The underlying levels that will decide a position's fate.
+
+    Distance is measured in the stock's own units. A stop three percent away
+    means something entirely different on a name that moves one percent a day
+    and one that moves four -- on the second it sits inside the noise and will
+    fire on a day where nothing happened. So the distance is a multiple of
+    average true range, and only falls back to a flat percentage when there is
+    not enough history to measure one.
+
+    The target is the stop distance scaled by the reward-to-risk ratio, so the
+    two cannot drift apart and quietly move the break-even win rate.
+    """
+    band = atr_pct if atr_pct and atr_pct > 0 else settings.fallback_stop_pct
+    stop_distance = band * settings.stop_atr_multiple
+    target_distance = stop_distance * settings.reward_to_risk
+
+    if direction == "up":
+        return spot * (1 - stop_distance), spot * (1 + target_distance)
+    return spot * (1 + stop_distance), spot * (1 - target_distance)
 
 
 def exit_limit_price(bid: float, ask: float, aggression: float) -> float:

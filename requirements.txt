@@ -1,5 +1,7 @@
-# Model. The proposer runs on Claude Opus 5.
+# Models. The proposer runs on whichever backend MODEL_PROVIDER names --
+# Claude by default, or any OpenAI-compatible host such as Featherless.
 anthropic>=0.40.0
+openai>=1.40.0
 
 # MCP client. Reads option chains, quotes and Greeks from Alpaca's official
 # MCP server. Orders do NOT go through this -- see docs/architecture.md.

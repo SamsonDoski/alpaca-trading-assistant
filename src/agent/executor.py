@@ -89,8 +89,14 @@ def new_client_order_id(symbol: str) -> str:
     The prefix marks orders this agent placed, which matters on an account that
     also holds positions opened by something else.
     """
+    # Eight hex characters, not six. Six is 16.7 million values, and drawing a
+    # couple of hundred of them collides roughly once in eight hundred attempts
+    # -- a birthday collision, which showed up as a test that passed locally and
+    # failed on the server by luck. Eight is 4.3 billion, the id is still under
+    # fifty characters against Alpaca's limit of 128, and the randomness costs
+    # nothing.
     stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-    return f"ata-{symbol}-{stamp}-{uuid.uuid4().hex[:6]}"
+    return f"ata-{symbol}-{stamp}-{uuid.uuid4().hex[:8]}"
 
 
 def _run_command(args: list[str], timeout: int) -> subprocess.CompletedProcess:

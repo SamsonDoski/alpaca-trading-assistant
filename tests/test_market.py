@@ -147,6 +147,39 @@ def test_position_decodes_a_long_option():
     assert position.unrealized_pnl == pytest.approx(360.0)
 
 
+def test_a_put_position_decodes_as_a_put_not_a_call():
+    """A live bug: this was defaulted rather than decoded, so a book of seven
+    puts reported itself as seven calls. The directional cap then blocked calls
+    and let puts through without limit, and the book went 100% one-sided --
+    exactly the concentration the gate exists to prevent."""
+    put = position_from_payload({
+        "symbol": "GOOGL261002P00350000", "qty": "2",
+        "avg_entry_price": "18.31", "current_price": "18.00"})
+    assert put is not None
+    assert put.right == "put"
+    assert put.direction.value == "down"
+
+
+def test_a_call_position_decodes_as_a_call():
+    call = position_from_payload({
+        "symbol": "MSFT261009C00495000", "qty": "1",
+        "avg_entry_price": "26.90", "current_price": "23.15"})
+    assert call is not None
+    assert call.right == "call"
+    assert call.direction.value == "up"
+
+
+def test_direction_is_never_defaulted_across_a_mixed_book():
+    """The whole book, decoded together -- the shape the gate actually sees."""
+    rows = [
+        {"symbol": "GOOGL261002P00350000", "qty": "2", "avg_entry_price": "18"},
+        {"symbol": "IWM260930P00300000", "qty": "4", "avg_entry_price": "9"},
+        {"symbol": "MSFT261009C00495000", "qty": "1", "avg_entry_price": "26"},
+    ]
+    book = [position_from_payload(r) for r in rows]
+    assert [p.right for p in book] == ["put", "put", "call"]
+
+
 def test_a_stock_position_is_ignored_rather_than_managed():
     """The account may hold things this agent did not open. Those stay the
     broker's business and never reach the exit logic."""
@@ -345,6 +378,61 @@ def test_chain_request_omits_filters_that_were_not_asked_for():
     _, arguments = session.calls[0]
     assert "type" not in arguments
     assert "expiration_date_gte" not in arguments
+
+
+# --- Parameter names, pinned against the live schema ----------------------
+#
+# Verified against the server's own tools/list on 31 Aug 2026. These matter
+# because the MCP server builds its tools from Alpaca's OpenAPI specs, so the
+# parameter names come from the REST query string rather than from the Python
+# SDK signature -- and the two differ. Guessing `symbol_or_symbols` from the SDK
+# produced a 400 on every exit check, which failed softly and quietly demoted
+# every underlying-keyed stop back to the premium rule it was built to replace.
+
+def test_the_option_quote_asks_for_symbols_not_symbol_or_symbols():
+    session = FakeSession({"get_option_latest_quote": {"quotes": {}}})
+    run(MarketReader(session).option_quote("AAPL261016C00310000"))
+    _, arguments = session.calls[0]
+    assert "symbols" in arguments
+    assert "symbol_or_symbols" not in arguments
+
+
+def test_the_stock_quote_asks_for_symbols():
+    session = FakeSession({"get_stock_latest_quote": {"quotes": {}}})
+    run(MarketReader(session).stock_price("AAPL"))
+    assert "symbols" in session.calls[0][1]
+
+
+def test_the_bars_call_asks_for_symbols():
+    session = FakeSession({"get_stock_bars": {"bars": {}}})
+    run(MarketReader(session).recent_bars("AAPL"))
+    assert "symbols" in session.calls[0][1]
+
+
+def test_the_news_call_asks_for_symbols():
+    session = FakeSession({"get_news": []})
+    run(MarketReader(session).headlines("AAPL"))
+    assert "symbols" in session.calls[0][1]
+
+
+def test_a_quote_decodes_into_a_bid_and_ask():
+    session = FakeSession({"get_option_latest_quote": {
+        "quotes": {"AAPL261016C00310000": {"bp": 15.40, "ap": 15.90}}}})
+    assert run(MarketReader(session).option_quote("AAPL261016C00310000")) == (15.40, 15.90)
+
+
+def test_a_stock_price_is_the_quote_midpoint():
+    """The midpoint rather than the last trade: a trade can be stale by minutes
+    on a quiet name while a quote is current."""
+    session = FakeSession({"get_stock_latest_quote": {
+        "quotes": {"AAPL": {"bp": 312.00, "ap": 314.00}}}})
+    assert run(MarketReader(session).stock_price("AAPL")) == 313.00
+
+
+def test_a_missing_stock_quote_returns_none_rather_than_zero():
+    """Zero would read as a real price and place every stop instantly."""
+    session = FakeSession({"get_stock_latest_quote": {"quotes": {}}})
+    assert run(MarketReader(session).stock_price("AAPL")) is None
 
 
 def test_the_reader_exposes_no_way_to_place_an_order():

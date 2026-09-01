@@ -219,6 +219,13 @@ def position_from_payload(payload: dict) -> OpenPosition | None:
         entry_price=entry,
         current_price=current,
         expiry=parsed.expiry,
+        # Decoded from the symbol, never defaulted. Omitting this let every
+        # position fall back to OpenPosition's "call" default, so a book of
+        # seven puts reported itself as seven calls -- and the directional cap
+        # then blocked calls while letting puts through without limit. The book
+        # went one hundred percent short-direction, which is exactly the
+        # concentration that gate exists to prevent.
+        right=parsed.right,
     )
 
 
@@ -421,9 +428,15 @@ class MarketReader:
         position itself, but a mark is a valuation, not something anyone has
         offered to pay -- and an exit has to be priced against a real bid.
         """
+        # `symbols`, not `symbol_or_symbols`. The MCP server builds its tools
+        # from Alpaca's OpenAPI specs, so the parameter name comes from the REST
+        # query string rather than from the Python SDK's signature -- and the two
+        # differ. Guessing it from the SDK produced a 400 on every exit check,
+        # which failed softly and quietly demoted every stop back to the premium
+        # rule it was meant to replace.
         try:
             payload = _as_dict(await self.call(TOOL_OPTION_QUOTE,
-                                               {"symbol_or_symbols": occ_symbol}))
+                                               {"symbols": occ_symbol}))
         except MarketDataError as exc:
             logger.warning("no quote for %s: %s", occ_symbol, exc)
             return None
@@ -436,6 +449,32 @@ class MarketReader:
         bid = _to_float(_first(quote, "bp", "bid_price", "bidPrice"))
         ask = _to_float(_first(quote, "ap", "ask_price", "askPrice"))
         return (bid, ask) if bid > 0 or ask > 0 else None
+
+    async def stock_price(self, symbol: str) -> float | None:
+        """The underlying's current price.
+
+        Needed at EXIT time, which is the awkward part: held symbols are
+        screened out before any brief is built, so the exit path has no other
+        source for where the stock stands now. Uses the quote midpoint rather
+        than the last trade, because a trade can be stale by minutes on a quiet
+        name while a quote is current.
+        """
+        try:
+            payload = _as_dict(await self.call(TOOL_STOCK_QUOTE, {"symbols": symbol}))
+        except MarketDataError as exc:
+            logger.warning("no stock quote for %s: %s", symbol, exc)
+            return None
+
+        quotes = _first(payload, "quotes", default=payload) or {}
+        quote = quotes.get(symbol) if isinstance(quotes, dict) else None
+        if not isinstance(quote, dict):
+            return None
+
+        bid = _to_float(_first(quote, "bp", "bid_price", "bidPrice"))
+        ask = _to_float(_first(quote, "ap", "ask_price", "askPrice"))
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2
+        return bid or ask or None
 
     async def recent_bars(self, symbol: str, days: int = 120) -> list[PriceBar]:
         """Daily bars for the underlying, oldest first.
@@ -592,9 +631,30 @@ async def open_reader(*, paper: bool = True):
     if not api_key or not secret_key:
         raise MarketDataError("ALPACA_API_KEY / ALPACA_SECRET_KEY are not set")
 
+    # Pinned, and the pinning is the point.
+    #
+    # `uvx` re-resolves its dependencies on EVERY invocation. That is convenient
+    # until an upstream release lands mid-session: on 31 Aug 2026 FastMCP 4.0.0
+    # was published during market hours, alpaca-mcp-server 2.3.0 could not import
+    # against it, and every pass from 14:30 ET onward died on startup with
+    # "ModuleNotFoundError: No module named 'fastmcp.tools.tool'" followed by a
+    # closed connection. Nothing in this repository changed. The floor did.
+    #
+    # A scheduled agent that resolves its own dependencies fresh every fifteen
+    # minutes is one upstream publish away from being dead, and it will die
+    # during market hours because that is when it runs. So the versions are
+    # named. `fastmcp<4` rather than an exact pin because 3.4.7 is the version
+    # this agent ran on all morning; Alpaca's own workaround suggests 3.1.0 if a
+    # tighter pin is ever needed.
+    #
+    # Both are overridable from the environment so a fix upstream can be adopted
+    # without a code change or a redeploy.
+    server_spec = os.getenv("ALPACA_MCP_SPEC", "alpaca-mcp-server==2.3.0")
+    fastmcp_spec = os.getenv("FASTMCP_SPEC", "fastmcp<4")
+
     parameters = StdioServerParameters(
         command="uvx",
-        args=["alpaca-mcp-server"],
+        args=["--from", server_spec, "--with", fastmcp_spec, "alpaca-mcp-server"],
         env={
             **os.environ,
             "ALPACA_API_KEY": api_key,

@@ -8,13 +8,208 @@
 # being ignored, because a typo in a risk limit that silently keeps the default
 # is invisible until it costs money.
 
+# ---------------------------------------------------------------------------
+# THE UNIVERSE, CHOSEN BY MEASUREMENT
+#
+# 44 candidate symbols were measured with `run.py spreads` during market hours
+# on 31 August 2026, in the 30-45 day window and the 0.55-0.75 delta band. The
+# result was not what picking well-known tickers would have produced.
+#
+# Alpaca's free Basic plan supplies an INDICATIVE options feed rather than full
+# OPRA, and its coverage is strikingly uneven. It quotes high-volume ETFs and a
+# couple of the largest single names properly, and everything else badly:
+#
+#     tradable        IWM 1.8%   SPY 2.1%   TLT 2.1%   QQQ 2.3%   GLD 2.3%
+#                     DIA 2.5%   IBIT 3.2%  SLV 3.3%   NVDA 4.0%
+#     marginal        TSLA 5.5%  SMH 8.3% (best strikes pass)
+#     unusable        MSFT 12.5%  AAPL 12.7%  GOOGL 14.3%  JPM 19.1%
+#                     WMT 21.8%  UNH 24.2%  UBER 27.2%  DIS 34.1%
+#                     XLF 8.5%   XLK 13.8%  XLV 22.8%   EEM 37.5%
+#
+# MSFT at 12.5% is the tell. It is one of the most liquid option markets in the
+# world and genuinely quotes near 1-2%, so that number measures the feed rather
+# than the market. Loosening max_spread_pct to admit it would mean sizing
+# positions off prices nobody would trade at.
+#
+# So the universe is what the data supports, and it turned out better than the
+# list we set out to build: equities across large and small cap, long treasuries,
+# gold, silver and bitcoin. TLT and GLD move on things that have nothing to do
+# with what moves SPY -- which is the diversification a basket of nine mega-cap
+# technology names never actually had.
+# ---------------------------------------------------------------------------
+
+# Two groups, and the difference is worth knowing when reading the journal.
+#
+# The ETFs and NVDA were chosen by measurement -- their median spread sits at or
+# below 4% even on the indicative feed, so their quotes can be taken at face
+# value. Measured medians are noted against each.
+#
+# The single names come from a watchlist proven over a longer run on a separate
+# system. Most of them report double-digit spreads on this feed, which is why
+# max_spread_pct now sits at 15% (see settings.py for what that gate does and no
+# longer does). Their sizing is therefore derived from quotes that are inflated
+# by an unknown amount -- an accepted, deliberate limitation, not an oversight.
+
+# ---------------------------------------------------------------------------
+# NARROWED TO THE MEASURED-TRADABLE NINE, 1 SEP 2026
+#
+# The wide names were removed after a day of live evidence, not on a hunch. Line
+# up each Monday loss against the spread measured for that symbol:
+#
+#     GOOGL   spread 14.3%   closed -14.2%
+#     MSFT    spread 12.5%   closed -13.9%   (-$905)
+#     V       spread 15.3%   closed -20.8%   (-$1,440)
+#     NFLX    spread 17.8%   closed -41.9%   (-$1,295)
+#     CRWD    spread   --    closed -32.0%   (-$700)
+#     IWM     spread  1.8%   ran     -6.5% then recovered to +5.4%
+#
+# The losses track the spreads, not the market. Roughly half of Monday's
+# -$4,340 was the cost of crossing a quote, paid at the ask on a feed that
+# quotes those names badly -- and then paid again on the way out. The one
+# position on a genuinely tight name is the one that came back.
+#
+# So the universe is now only what the indicative feed prices properly. Nine
+# names, 1.8-4.0% to cross instead of 12-18%. Fewer opportunities, but each one
+# is a bet on direction rather than a bet that has to outrun its own entry cost.
+#
+# Removing a symbol does NOT strand an open position: the exit path iterates the
+# broker's positions, not this list, so anything still held is managed to its
+# stop or target regardless of whether it may be re-entered.
+# ---------------------------------------------------------------------------
+
 symbols:
-  - SPY
-  - QQQ
-  - AAPL
-  - MSFT
-  - NVDA
-  - AMZN
-  - META
-  - GOOGL
-  - TSLA
+  - IWM          # 1.8%
+  - SPY          # 2.1%
+  - TLT          # 2.1%
+  - QQQ          # 2.3%
+  - GLD          # 2.3%
+  - DIA          # 2.5%
+  - IBIT         # 3.2%
+  - SLV          # 3.3%
+  - NVDA         # 4.0%
+
+# ---------------------------------------------------------------------------
+# ENTRY AGGRESSION: 1.0, RAISED FROM 0.6 BY A LIVE RESULT
+#
+# 0 = bid, 1 = ask. The original 0.6 was patience: sit inside the spread, let a
+# missed entry go, the signal returns in fifteen minutes. That reasoning assumes
+# the quote is real.
+#
+# On 31 Aug 2026 the first live pass placed four orders -- MSFT, TSLA, JPM, CRWV
+# -- at limits derived from the indicative feed. Thirty minutes later all four
+# were still `status: new`, filled_qty 0. The limits sat below where the market
+# actually traded.
+#
+# Setting this to 1.0 means the limit is placed AT the quoted ask. That is not
+# the same as agreeing to pay it: a limit is a ceiling, and a marketable limit
+# fills at the best available price, not at the limit. When the quoted ask is
+# inflated relative to the real book -- which is what this feed does -- naming it
+# is what makes the order marketable at all.
+# ---------------------------------------------------------------------------
+entry_aggression: 1.0
+
+# ---------------------------------------------------------------------------
+# CONCURRENT POSITIONS: 8, RAISED FROM 5
+#
+# settings.py records that 5 beat 8, 10 and 15 over 2.4 years, winning in both
+# split halves independently. That measurement stands -- but it was taken on a
+# NINE-name watchlist, and it does not transfer to this one unchanged.
+#
+# The cap works as a quality filter because candidates are ranked by conviction
+# and only the best are taken; raising it reaches further down that ranking. On
+# nine names, rank 8 meant very nearly the worst thing on offer. On thirty, the
+# eighth-best candidate is a different proposition entirely, and the reasoning
+# that justified 5 is measuring a different quantity.
+#
+# The risk arithmetic is unchanged and bounded: 8 positions at 4% of equity is
+# 32% deployed, and a long option cannot lose more than its premium, with each
+# one stopped at -25%. Worst case across the whole book is roughly -8% of the
+# account, not -32%.
+#
+# This is a deliberate choice about breadth on a short measurement window, not a
+# claim that 8 tested better. It did not; it was not tested here at all.
+# ---------------------------------------------------------------------------
+max_positions: 8
+
+# ---------------------------------------------------------------------------
+# CORRELATION GROUPS
+#
+# Which names move together. Every other gate reasons about ONE trade: slots
+# counted eight, the budget sized each at 4%, and nothing anywhere asked whether
+# the eight were secretly the same bet. Eight long calls on mega-cap technology
+# is not a diversified book -- it is one macro position with eight chances to be
+# wrong at the same time.
+#
+# Declared rather than computed. A rolling correlation matrix over daily returns
+# would be more precise and also unstable, expensive, and impossible to explain
+# inside a one-line refusal. "Three tech names is enough tech" is a rule a person
+# can check against the open book in two seconds.
+# ---------------------------------------------------------------------------
+correlation_groups:
+  # Broad US equity -- these are close to the same instrument
+  SPY: us_equity
+  QQQ: us_equity
+  DIA: us_equity
+  IWM: us_equity
+  AIQ: us_equity
+
+  # Mega-cap technology
+  AAPL: bigtech
+  MSFT: bigtech
+  GOOGL: bigtech
+  AMZN: bigtech
+  META: bigtech
+  NFLX: bigtech
+
+  # Semiconductors and AI infrastructure -- one trade wearing many tickers
+  NVDA: semis
+  AMD: semis
+  AVGO: semis
+  MU: semis
+  SMCI: semis
+  CRWV: semis
+  ORCL: semis
+
+  # Software
+  CRWD: software
+  PLTR: software
+
+  # Precious metals
+  GLD: metals
+  SLV: metals
+
+  # Rates and crypto get their own groups: they are the genuinely
+  # uncorrelated part of the book and should never be crowded out
+  TLT: rates
+  IBIT: crypto
+
+  # Everything else
+  JPM: financials
+  V: financials
+  LLY: health
+  WMT: consumer
+  COST: consumer
+  TSLA: consumer
+
+max_per_group: 2
+max_same_direction: 5
+
+# ---------------------------------------------------------------------------
+# PREMIUM RICHNESS: TIGHTENED TO 1.15 FROM 1.40
+#
+# The gate is demonstrably working -- on 1 Sep it refused SPY at 2.00x realized,
+# JPM at 2.04x and DIA at 1.70x, all in one pass. But 1.40 still admits premium
+# priced forty percent above what the underlying actually delivers, and for a
+# buyer that is a headwind on every trade regardless of direction.
+#
+# 1.15 keeps the definition honest: buy when the option is priced at roughly
+# what the stock does, or cheaper. The best entry the system has made was PLTR
+# at 0.44x -- an option priced for less than half the movement the stock was
+# actually delivering -- and that is the shape of trade this number is meant to
+# find.
+#
+# The cost is fewer trades. That is the intended trade-off: this is the one
+# input in the whole strategy with a defensible economic basis behind it, and
+# being selective about it is worth more than being busy.
+# ---------------------------------------------------------------------------
+max_iv_to_realized: 1.15

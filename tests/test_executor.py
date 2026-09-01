@@ -210,8 +210,13 @@ def test_every_order_carries_a_client_order_id():
 
 
 def test_client_order_ids_are_unique_across_orders_in_the_same_second():
-    ids = {new_client_order_id("AAPL261016C00310000") for _ in range(200)}
-    assert len(ids) == 200
+    """Ten thousand draws, which at eight hex characters collides with
+    probability around one in ninety thousand. At six it collided about once in
+    every eight hundred runs of two hundred -- the test passed locally and
+    failed on the server, which is the worst possible way for a deploy gate to
+    behave."""
+    ids = {new_client_order_id("AAPL261016C00310000") for _ in range(10_000)}
+    assert len(ids) == 10_000
 
 
 def test_a_client_order_id_carries_the_symbol_and_our_prefix():
