@@ -7,6 +7,20 @@ The agent runs unattended every 15 minutes while the US market is open. On each
 pass it closes what needs closing, then looks for one new position at a time,
 and writes down everything it considered — including what it refused and why.
 
+---
+
+**Hackathon submission**
+
+| | |
+| --- | --- |
+| Alpaca paper account number | `PA3B2PDNZ732` |
+| Alpaca account id | `48ebdce5-2b6b-4a96-b13b-3f3c0e34e7c6` |
+| One-page write-up | **[docs/WRITEUP.md](docs/WRITEUP.md)** — thesis, AI logic, every risk gate, the Alpaca integration, live results, and disclosure of pre-existing work |
+| Alpaca technologies used | Alpaca MCP Server (all market and account reads), Alpaca CLI (all order writes), Alpaca Trading API paper environment, Alpaca Market Data — option chains with Greeks and implied volatility, quotes, bars, corporate news, and the market clock |
+| Tests | 312, no network and no API key required — `pytest -q` |
+
+---
+
 ## The idea in one sentence
 
 **The model proposes; the gates dispose.**

@@ -18,7 +18,7 @@ rule the four-hundredth time exactly as it did the first.
 So this agent gives the model the noticing and gives plain Python the discipline.
 **Claude never holds a tool that can place an order.** It produces a view — a
 symbol, a direction, a stated conviction, one sentence of reasoning — and that
-view then has to survive eleven deterministic gates that have no opinions and
+view then has to survive fifteen deterministic gates that have no opinions and
 cannot be argued with.
 
 Two invariants make that structural rather than aspirational, and both are
@@ -75,6 +75,7 @@ happens for a trade a free check was always going to refuse.
 | `kill_switch` | A manual freeze on opening. Surgical by design: exits, stop checks and reporting keep running while it is on. |
 | `market_open` | An order into a closed market queues and fills at a price nobody has seen. |
 | `position_slots` | Reads as a risk limit, works as a quality filter. |
+| `sector_concentration` | Caps how many positions may sit in one declared correlation group. Eight long calls on mega-cap technology is not a diversified book — it is one macro bet wearing eight tickers. |
 | `cooldown` | Blocks re-entry after a stop loss, never after a win. |
 | `not_already_held` | One position per underlying. |
 
@@ -86,6 +87,9 @@ happens for a trade a free check was always going to refuse.
 | `delta_band` | Real Greeks from the chain, not a moneyness proxy. |
 | `spread_width` | A position opened across a 5% spread starts 5% down. |
 | `expiry_window` | Including the near-expiry exclusion. |
+| `directional_balance` | Caps how one-sided the book may become, so a single macro view cannot quietly become the whole account. |
+| `premium_richness` | Refuses to buy an option implying more movement than the underlying has actually been delivering — implied volatility from the chain against realized volatility over 30 sessions, ceiling 1.15x. The one input here with a defensible economic basis behind it. |
+| `decay_burden` | Prices Black-Scholes theta as a percentage of premium per day and refuses a contract whose daily bleed is too large a share of the move being bet on. |
 | `risk_budget` | **Shrinks.** Caps one trade at its share of equity. |
 | `buying_power` | **Shrinks.** The only gate that asks whether the account can pay for the whole book at once. |
 
@@ -126,11 +130,17 @@ of someone else's API.
 
 ## Running unattended
 
-A Ubuntu server, `cron` every fifteen minutes on weekdays, pinned to `CRON_TZ=UTC`
-so the trading window does not depend on the server's clock. The schedule fires
-wider than market hours on purpose and lets the broker's own clock decide whether
-there is anything to do — encoding session times precisely means being silently
-wrong twice a year.
+A Ubuntu server, `cron` every fifteen minutes on weekdays. The installer reads
+the server's own UTC offset and computes the local hours that cover the US
+session, because the textbook answer — `CRON_TZ=UTC` with fixed UTC hours — was
+tried first and silently did not work: this server's cron ignores `CRON_TZ`. The
+schedule fires wider than market hours on purpose and lets the broker's own clock
+decide whether there is anything to do, since encoding session times precisely
+means being silently wrong twice a year.
+
+One codebase runs two accounts. `ATA_PROFILE` selects an env file, a state
+directory and a config, so a second account is a second cron line rather than a
+second copy of the system.
 
 A `flock` lockfile makes a slow pass skip rather than collide with the next one:
 two passes both reading "four of five slots used" would both open a position.
@@ -142,7 +152,7 @@ failure fails in the safe direction.
 
 ## Evidence
 
-**183 tests**, covering 3,410 lines of source, all running with no network, no
+**312 tests** — 3,342 lines of them against 5,678 lines of source — all running with no network, no
 broker, no model and no API key — because every collaborator is injected rather
 than constructed. The risk system is the part that must not be wrong, so it is
 also the part that can be exercised exhaustively in under two seconds.
@@ -158,6 +168,45 @@ reasoning and the full gate trace, not only the trades. An agent that trades
 twice in a week is indistinguishable from a broken one until you can see the
 ninety decisions it made in between. `run.py report` renders that into a single
 self-contained HTML file.
+
+## What it actually did
+
+Live on the competition paper account from Monday 31 August, unattended, roughly
+26 passes a day.
+
+The honest headline is that it is **down about 4.9%** on the week. The reason is
+worth more than the number. Alpaca's free tier serves an **indicative** options
+feed rather than full OPRA, and it quotes some names badly — MSFT, one of the
+most liquid option markets in the world, showed a 12.5% spread. Monday's book was
+opened across those quotes, and the losses line up against the spreads rather than
+against the market:
+
+| symbol | measured spread | closed |
+|---|---|---|
+| GOOGL | 14.3% | -14.2% |
+| MSFT | 12.5% | -13.9% |
+| V | 15.3% | -20.8% |
+| NFLX | 17.8% | -41.9% |
+| IWM | 1.8% | ran -6.5%, recovered to +5.4% |
+
+Roughly half of Monday's loss was the cost of crossing a quote, paid at the ask
+and paid again on the way out. The one position on a genuinely tight name is the
+one that came back. That evidence drove two changes — the universe was cut to
+what the feed prices properly, and the spread gate now does that filtering pass
+by pass — and both are recorded, with the measurements, in `config.yaml`.
+
+**The failure mode worth reporting is a different one.** Every serious defect in
+this system failed *silently and looked like a quiet market*: the MCP server
+crashing after an upstream dependency released a breaking version, eight passes
+dead; a wrong parameter name returning 400 on every option quote, which failed
+soft and demoted every underlying-keyed stop to the premium rule without saying
+so; a crontab filter that unscheduled a live account for 45 minutes; a
+take-profit that went out as a patient limit and simply sat unfilled. None of
+them raised. All of them produced a log that read like nothing happening.
+
+That is the argument for the journal and for the out-of-process crash alarm. An
+agent that trades twice in a week is indistinguishable from a broken one until
+you can read the ninety decisions it made in between.
 
 ## Disclosure of pre-existing work
 
