@@ -200,16 +200,24 @@ class FakeReader:
 class FakeExecutor:
     is_dry_run = True
 
-    def __init__(self, *, fail_open=False, resting=(), fail_orders=False):
+    def __init__(self, *, fail_open=False, resting=(), fail_orders=False,
+                 resting_exits=()):
         self.actions: list[tuple[str, str]] = []
         self._fail_open = fail_open
         self._resting = list(resting)
         self._fail_orders = fail_orders
+        self._resting_orders = [
+            {"symbol": s, "side": "sell", "id": f"sell-{s}"} for s in resting_exits]
 
     def open_orders(self):
         if self._fail_orders:
             raise ExecutionError("broker unreachable")
-        return [{"symbol": s} for s in self._resting]
+        return list(self._resting_orders) + [
+            {"symbol": s, "side": "buy", "id": f"buy-{s}"} for s in self._resting]
+
+    def cancel(self, order_id):
+        self.actions.append(("cancel", order_id))
+        return True
 
     def _receipt(self, symbol, qty):
         return OrderReceipt("ata-x", symbol, qty, None, status="validated", dry_run=True)
@@ -534,6 +542,62 @@ def test_premium_noise_no_longer_stops_out_a_live_thesis(journal):
     assert check_exit(held, SETTINGS, TODAY, holding=holding, spot=311.0) is None
 
 
+def test_a_large_gain_is_banked_even_before_the_underlying_target():
+    """Observed live on 2 Sep 2026: a PLTR put stood at +50.7% -- $1,105 -- with
+    PLTR at 167.88 against a target of 159.21, and nothing in the system would
+    have sold it. The underlying target decides when the THESIS is finished;
+    this decides when the POSITION has already paid."""
+    from agent.exits import ExitReason, check_exit
+    from agent.journal import Holding
+    holding = Holding("PLTR261016P00200000", "PLTR", "2026-09-01T13:00:00",
+                      "down", 186.38, 21.80, stop_spot=199.97, target_spot=159.21)
+    held = position("PLTR", entry=21.80, current=32.85)      # +50.7%
+    decision = check_exit(held, SETTINGS, TODAY, holding=holding, spot=167.88)
+    assert decision is not None
+    assert decision.reason is ExitReason.PREMIUM_TARGET
+    assert "still short of the" in decision.detail
+
+
+def test_a_gain_below_the_backstop_keeps_running():
+    """The underlying target still governs anything short of the threshold."""
+    from agent.exits import check_exit
+    from agent.journal import Holding
+    holding = Holding("PLTR261016P00200000", "PLTR", "2026-09-01T13:00:00",
+                      "down", 186.38, 21.80, stop_spot=199.97, target_spot=159.21)
+    held = position("PLTR", entry=21.80, current=28.00)      # +28%
+    assert check_exit(held, SETTINGS, TODAY, holding=holding, spot=172.0) is None
+
+
+def test_banking_a_gain_is_patient_not_urgent():
+    """A winner is not racing anything, so it goes out as a limit rather than
+    crossing the spread at market."""
+    from agent.exits import check_exit
+    from agent.journal import Holding
+    holding = Holding("PLTR261016P00200000", "PLTR", "2026-09-01T13:00:00",
+                      "down", 186.38, 21.80, stop_spot=199.97, target_spot=159.21)
+    held = position("PLTR", entry=21.80, current=32.85)
+    assert not check_exit(held, SETTINGS, TODAY, holding=holding, spot=167.88).urgent
+
+
+def test_banking_a_gain_starts_no_cooldown(journal):
+    """A win means the reasoning worked. Nothing to cool off from."""
+    journal.record("closed", "PLTR", "PLTR261016P00200000",
+                   "premium target -- premium up 50.7%", pnl=1105)
+    assert journal.cooling_off(within_days=2) == {}
+
+
+def test_the_underlying_target_still_wins_when_both_are_reached():
+    """When the thesis actually completed, that is the reason recorded -- the
+    journal should say the trade worked, not that a backstop caught it."""
+    from agent.exits import ExitReason, check_exit
+    from agent.journal import Holding
+    holding = Holding("PLTR261016P00200000", "PLTR", "2026-09-01T13:00:00",
+                      "down", 186.38, 21.80, stop_spot=199.97, target_spot=159.21)
+    held = position("PLTR", entry=21.80, current=40.00)
+    decision = check_exit(held, SETTINGS, TODAY, holding=holding, spot=155.0)
+    assert decision.reason is ExitReason.TAKE_PROFIT
+
+
 def test_a_collapsed_premium_still_closes_through_the_backstop():
     """The case the underlying cannot see: implied volatility gutting the option
     while the stock does nothing."""
@@ -574,6 +638,62 @@ def test_closing_a_position_clears_its_recorded_levels(journal):
     assert journal.holding("X261016C00310000") is not None
     journal.close_holding("X261016C00310000")
     assert journal.holding("X261016C00310000") is None
+
+
+# --- Escalating an exit that did not fill ---------------------------------
+#
+# Observed live on 2 Sep 2026: a take-profit went out as a patient limit at
+# 13:15, sat unfilled, and the next pass would have placed a second sell for the
+# same single contract. An unfilled exit is a decision that has not happened --
+# for a winner it is a gain not banked, for a stop it is a loss still running.
+
+def test_a_stale_exit_order_is_cancelled_and_escalated_to_market(journal):
+    stopped = position("AAPL", entry=20.00, current=15.00)
+    executor = FakeExecutor(resting_exits=[stopped.occ_symbol])
+    run(FakeReader(positions=(stopped,)), executor, FakeProposer({}), journal,
+        RecordingNotifier())
+
+    kinds = [action for action, _ in executor.actions]
+    assert "cancel" in kinds
+    assert "sell_market" in kinds
+    assert "sell_limit" not in kinds
+
+
+def test_the_escalation_is_recorded_as_such(journal):
+    stopped = position("AAPL", entry=20.00, current=15.00)
+    run(FakeReader(positions=(stopped,)),
+        FakeExecutor(resting_exits=[stopped.occ_symbol]),
+        FakeProposer({}), journal, RecordingNotifier())
+    detail = journal.recent(limit=5)[0].detail
+    assert "did not fill" in detail
+
+
+def test_only_one_exit_order_exists_per_position_per_pass(journal):
+    """The hazard: eight passes, eight sell orders, one contract."""
+    stopped = position("AAPL", entry=20.00, current=15.00)
+    executor = FakeExecutor(resting_exits=[stopped.occ_symbol])
+    run(FakeReader(positions=(stopped,)), executor, FakeProposer({}), journal,
+        RecordingNotifier())
+    sells = [a for a, _ in executor.actions if a.startswith("sell")]
+    assert len(sells) == 1
+
+
+def test_a_position_with_no_resting_order_still_uses_a_limit(journal):
+    """Escalation applies to a retry, not to a first attempt."""
+    winner = position("AAPL", entry=10.00, current=15.00)
+    executor = FakeExecutor()
+    run(FakeReader(positions=(winner,)), executor, FakeProposer({}), journal,
+        RecordingNotifier())
+    assert ("sell_limit", winner.occ_symbol) in executor.actions
+
+
+def test_a_resting_buy_order_does_not_trigger_exit_escalation(journal):
+    """Only sells count. A resting entry is a different thing entirely."""
+    winner = position("AAPL", entry=10.00, current=15.00)
+    executor = FakeExecutor(resting=["MSFT261016C00310000"])
+    run(FakeReader(positions=(winner,)), executor, FakeProposer({}), journal,
+        RecordingNotifier())
+    assert ("sell_limit", winner.occ_symbol) in executor.actions
 
 
 def test_the_summary_reports_refusals(journal):

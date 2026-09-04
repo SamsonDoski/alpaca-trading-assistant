@@ -37,6 +37,10 @@ class ExitReason(str, Enum):
     # different and, unlike a real stop, does not start a cooldown: the thesis
     # was never disproved, so there is nothing to cool off from.
     PREMIUM_BACKSTOP = "premium backstop"
+    # The mirror of that on the winning side: the option has gained enough to be
+    # worth banking even though the underlying has not reached the level the
+    # thesis was aiming at.
+    PREMIUM_TARGET = "premium target"
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +129,25 @@ def check_exit(position: OpenPosition, settings: Settings, today: date,
             position, ExitReason.TAKE_PROFIT,
             f"{position.underlying} moved {move:+.1%} in favour "
             f"(through {holding.target_spot:,.2f}); premium {ret:+.1%}")
+
+    # The thesis has not finished playing out, but the option has already gained
+    # enough to be worth taking.
+    #
+    # Keying exits to the underlying is right for the STOP -- a premium stop
+    # fires on noise. The target side is not symmetric: a large premium gain is
+    # not noise, it is money, and holding it while waiting for the underlying to
+    # travel further risks giving it back. Observed directly on 2 Sep 2026, when
+    # a PLTR put stood at +50.7% with its underlying target still 5% away.
+    #
+    # So the underlying target still governs the thesis, and this catches the
+    # case where the position has already paid regardless.
+    if ret >= settings.premium_target_backstop_pct:
+        return ExitDecision(
+            position, ExitReason.PREMIUM_TARGET,
+            f"premium up {ret:.1%}, past the "
+            f"{settings.premium_target_backstop_pct:.0%} take-profit backstop, "
+            f"with {position.underlying} at {spot:,.2f} still short of the "
+            f"{holding.target_spot:,.2f} target")
 
     # The thesis is alive but the option has been gutted anyway -- almost always
     # implied volatility collapsing. Set far wider than the real stop, because

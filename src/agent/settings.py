@@ -187,6 +187,18 @@ class Settings:
     # reason.
     premium_backstop_pct: float = 0.50
 
+    # The same idea on the winning side: bank a gain this large regardless of
+    # where the underlying stands.
+    #
+    # The stop and the target are deliberately NOT symmetric in what they key
+    # to. A premium-keyed stop fires on noise, so the stop belongs on the
+    # underlying. A large premium gain is not noise -- it is money -- and
+    # holding it while waiting for the underlying to travel further risks
+    # handing it back. Seen directly on 2 Sep 2026: a PLTR put at +50.7% with
+    # its underlying target still five percent away, and no rule that would
+    # take it.
+    premium_target_backstop_pct: float = 0.50
+
     # Close this many days before expiry regardless of P&L. Time decay
     # accelerates into the final week and the position stops behaving like the
     # directional bet it was opened as.

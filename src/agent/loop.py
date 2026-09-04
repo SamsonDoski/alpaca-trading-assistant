@@ -117,6 +117,16 @@ async def run_pass(
         logger.info("market is closed; nothing to do")
         return result
 
+    # Exit orders already resting at the broker, by contract. Read before the
+    # exit loop because it decides between placing a fresh order and escalating
+    # a stale one -- and because without it the same position is sold once per
+    # pass until something fills.
+    try:
+        resting_exits = await _resting_exit_orders(executor)
+    except ExecutionError as exc:
+        logger.warning("could not read resting exit orders: %s", exc)
+        resting_exits = {}
+
     # --- 2. Exits, before anything else ----------------------------------
     for position in positions:
         # The stop is keyed to the underlying, so the underlying's price is
@@ -131,7 +141,8 @@ async def run_pass(
         if decision is None:
             continue
         try:
-            await _close(decision, reader, executor, journal, notifier, settings)
+            await _close(decision, reader, executor, journal, notifier, settings,
+                         stale_order=resting_exits.get(position.occ_symbol))
             result.closed += 1
         except ExecutionError as exc:
             message = f"failed to close {position.occ_symbol}: {exc}"
@@ -352,10 +363,56 @@ async def run_pass(
     return result
 
 
+async def _resting_exit_orders(executor: CliExecutor) -> dict[str, str]:
+    """Contract symbol -> order id, for sell orders not yet filled.
+
+    An exit that has not filled is the exit path's version of the resting-order
+    problem the entry gates already handle. Without this the same position is
+    sold once per pass -- eight orders for one contract over an afternoon.
+    """
+    resting = {}
+    for order in executor.open_orders():
+        if str(order.get("side", "")).lower() != "sell":
+            continue
+        symbol, order_id = str(order.get("symbol", "")), str(order.get("id", ""))
+        if symbol and order_id:
+            resting[symbol] = order_id
+    return resting
+
+
 async def _close(decision: ExitDecision, reader, executor: CliExecutor,
-                 journal: Journal, notifier: Notifier, settings: Settings) -> None:
-    """Close one position, patiently or immediately depending on why."""
+                 journal: Journal, notifier: Notifier, settings: Settings,
+                 *, stale_order: str | None = None) -> None:
+    """Close one position, patiently or immediately depending on why.
+
+    **A resting exit order means last pass's limit did not fill**, and the
+    correct response is to escalate rather than to wait again or to stack a
+    second order on top. The limit is cancelled and the position closed at
+    market.
+
+    That is the same lesson the stop path already learned the expensive way: a
+    missed exit is not harmless. It applies to winners too -- an unfilled
+    take-profit is a gain that has not been banked, and on this data feed a
+    patient limit can sit unfilled for the rest of the session.
+    """
     position = decision.position
+
+    if stale_order:
+        logger.info("escalating %s: previous exit limit did not fill",
+                    position.occ_symbol)
+        executor.cancel(stale_order)
+        receipt = executor.close_at_market(position)
+        pnl = position.unrealized_pnl
+        detail = (f"{_detail_prefix(decision)} — {decision.detail}, "
+                  f"escalated to market after the limit did not fill. "
+                  f"P&L ${pnl:+,.0f} ({position.return_pct:+.1%}) "
+                  f"[{receipt.client_order_id}]")
+        journal.record("closed", position.underlying, position.occ_symbol,
+                       detail, pnl=pnl)
+        journal.close_holding(position.occ_symbol)
+        notifier.closed(position.occ_symbol, detail, won=pnl > 0)
+        return
+
     quote = await reader.option_quote(position.occ_symbol)
 
     if decision.urgent or quote is None:

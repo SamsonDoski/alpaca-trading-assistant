@@ -77,7 +77,33 @@
 # stop or target regardless of whether it may be re-entered.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# WIDENED AGAIN, 2 SEP 2026 -- AND A CORRECTION
+#
+# The narrowing above was decided on ONE measurement. Re-measuring the same
+# names two days later during market hours showed spreads move far more than
+# that assumed:
+#
+#     PLTR   11.2% on 31 Aug  ->  3.8% on 2 Sep
+#     V      15.3% on 31 Aug  ->  8.6% on 2 Sep
+#     JPM    19.1% on 31 Aug  -> 11.2% on 2 Sep
+#
+# So a wide reading is partly a property of WHEN you looked, not only of the
+# name. The narrowing was still the right call for Monday -- those names really
+# did cost 12-18% to cross that day, and the losses matched -- but treating one
+# snapshot as permanent was wrong.
+#
+# The gate is what makes widening safe. A name that quotes badly at the moment
+# the agent looks is refused at that moment; the only cost of listing it is a
+# model call. So the list is now generous and the spread gate does the filtering
+# pass by pass, which is what it was always for.
+#
+# These six add the sectors the ETF-and-metals core had none of: financials,
+# healthcare, consumer staples, autos and software.
+# ---------------------------------------------------------------------------
+
 symbols:
+  # --- Core: measured tradable on both days ----------------------------
   - IWM          # 1.8%
   - SPY          # 2.1%
   - TLT          # 2.1%
@@ -87,6 +113,20 @@ symbols:
   - IBIT         # 3.2%
   - SLV          # 3.3%
   - NVDA         # 4.0%
+
+  # --- Sector breadth: measured tradable 2 Sep -------------------------
+  - PLTR         # 3.8%,  IV/RV 0.84  software
+  - F            # 6.3%,  IV/RV 0.97  autos
+  - KO           # 8.0%,  IV/RV 0.99  consumer staples
+  - V            # 8.6%,  IV/RV 1.04  financials
+  - PFE          # 10.6%, IV/RV 1.03  healthcare
+  - XLV          # 14.1%, IV/RV 0.83  healthcare sector
+  #
+  # Deliberately NOT listed, with the reason, so the next reader does not
+  # re-add them without re-measuring:
+  #   JPM   11.2% wide AND implied at 1.76x realized
+  #   MU    $6,977 a contract against a $3,880 per-trade budget
+  #   T     17.3% wide     TTWO  19.0% wide
 
 # ---------------------------------------------------------------------------
 # ENTRY AGGRESSION: 1.0, RAISED FROM 0.6 BY A LIVE RESULT
@@ -186,6 +226,12 @@ correlation_groups:
   # Everything else
   JPM: financials
   V: financials
+  BAC: financials
+  PFE: health
+  XLV: health
+  F: consumer
+  KO: consumer
+  INTC: semis
   LLY: health
   WMT: consumer
   COST: consumer
@@ -213,3 +259,21 @@ max_same_direction: 5
 # being selective about it is worth more than being busy.
 # ---------------------------------------------------------------------------
 max_iv_to_realized: 1.15
+
+# ---------------------------------------------------------------------------
+# TAKE-PROFIT BACKSTOP: 50% OF PREMIUM
+#
+# Keying exits to the underlying fixed the stop, which used to fire on noise.
+# It also, unintentionally, removed any rule that would take a large gain: the
+# position now waits for the underlying to reach its target no matter how far
+# the option has already run.
+#
+# On 2 Sep 2026 a PLTR put stood at +50.7% -- $1,105 -- with PLTR at 167.88
+# against a target of 159.21, another five percent away. Nothing in the system
+# would have sold it, and the scoring window closes the following evening.
+#
+# So the underlying target still decides when the THESIS is finished, and this
+# decides when the POSITION has already paid. Asymmetric on purpose: a premium
+# loss can be noise, a premium gain of this size is not.
+# ---------------------------------------------------------------------------
+premium_target_backstop_pct: 0.50
