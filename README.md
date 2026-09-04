@@ -15,6 +15,7 @@ and writes down everything it considered — including what it refused and why.
 | --- | --- |
 | Alpaca paper account number | `PA31QI8P0F0H` |
 | Alpaca account id | `af5eebaf-c644-4a01-abc7-86951499832c` |
+| Slide deck | **[docs/Killswitch-Capital-slides.pdf](docs/Killswitch-Capital-slides.pdf)** — 14 slides, 16:9 |
 | One-page write-up | **[docs/WRITEUP.md](docs/WRITEUP.md)** — thesis, AI logic, every risk gate, the Alpaca integration, live results, and disclosure of pre-existing work |
 | Alpaca technologies used | Alpaca MCP Server (all market and account reads), Alpaca CLI (all order writes), Alpaca Trading API paper environment, Alpaca Market Data — option chains with Greeks and implied volatility, quotes, bars, corporate news, and the market clock |
 | Live result | +2.36% — equity $102,361, realized +$3,280 over three closed round trips |
