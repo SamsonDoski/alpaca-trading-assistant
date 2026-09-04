@@ -4,7 +4,7 @@
 code disposes.**
 
 Alpaca AI Trading Agents Hackathon · 28 August – 4 September 2026
-Competition paper account: `PA3B2PDNZ732`
+Competition paper account: `PA31QI8P0F0H`  ·  id `af5eebaf-c644-4a01-abc7-86951499832c`
 
 ---
 
@@ -171,15 +171,33 @@ self-contained HTML file.
 
 ## What it actually did
 
-Live on the competition paper account from Monday 31 August, unattended, roughly
-26 passes a day.
+Live and unattended on the competition paper account from Tuesday 1 September,
+roughly 26 passes a day.
 
-The honest headline is that it is **down about 4.9%** on the week. The reason is
-worth more than the number. Alpaca's free tier serves an **indicative** options
-feed rather than full OPRA, and it quotes some names badly — MSFT, one of the
-most liquid option markets in the world, showed a 12.5% spread. Monday's book was
-opened across those quotes, and the losses line up against the spreads rather than
-against the market:
+**Equity $102,361 against $100,000 opening — up 2.36%.** Realized +$3,280 across
+three closed round trips, with an open book of eight positions carrying -$928.
+
+| round trip | entry | exit | result |
+|---|---|---|---|
+| NVDA 210 call | 16.35, 1 Sep | 26.05, 4 Sep | **+$1,940, +59.3%** |
+| IBIT 42 call | 3.35, 1 Sep | 5.10, 3 Sep | **+$1,925, +52.2%** |
+| GLD 416 put | 21.50, 2 Sep | 15.65, 3 Sep | -$585, -27.2% |
+
+Two of three closed positions won, and the losing one was cut at roughly the
+size the risk rules are built to permit. Both winners were closed by the same
+rule: a take-profit backstop on the premium, added on 3 September after watching
+a position stand at +50% while the underlying target it was actually keyed to
+was still five percent away. Keying stops to the underlying is right — a
+premium-keyed stop fires on noise — but the target side is not symmetric. A
+large premium loss can be noise; a large premium gain is money. That asymmetry
+is the difference between this account's result and a flat week.
+
+**What the account before it paid for.** A first account ran from 31 August on a
+wider universe, and lost about 4% doing it. The losses are worth reading because
+they were not random. Alpaca's free tier serves an **indicative** options feed
+rather than full OPRA, and it quotes some names badly — MSFT, one of the most
+liquid option markets in the world, showed a 12.5% spread. Line each loss up
+against the spread measured for that symbol:
 
 | symbol | measured spread | closed |
 |---|---|---|
@@ -189,11 +207,14 @@ against the market:
 | NFLX | 17.8% | -41.9% |
 | IWM | 1.8% | ran -6.5%, recovered to +5.4% |
 
-Roughly half of Monday's loss was the cost of crossing a quote, paid at the ask
-and paid again on the way out. The one position on a genuinely tight name is the
-one that came back. That evidence drove two changes — the universe was cut to
-what the feed prices properly, and the spread gate now does that filtering pass
-by pass — and both are recorded, with the measurements, in `config.yaml`.
+The losses track the spreads, not the market. Roughly half of that loss was the
+cost of crossing a quote, paid at the ask and paid again on the way out, and the
+one position on a genuinely tight name is the one that came back. So the
+universe was cut to what the feed prices properly, the spread gate now does that
+filtering pass by pass, and the account above ran on the corrected system. The
+measurements and the reasoning are recorded in `config.yaml`, including a later
+correction where re-measuring showed those spreads move far more intraday than
+one snapshot suggested.
 
 **The failure mode worth reporting is a different one.** Every serious defect in
 this system failed *silently and looked like a quiet market*: the MCP server
@@ -201,8 +222,9 @@ crashing after an upstream dependency released a breaking version, eight passes
 dead; a wrong parameter name returning 400 on every option quote, which failed
 soft and demoted every underlying-keyed stop to the premium rule without saying
 so; a crontab filter that unscheduled a live account for 45 minutes; a
-take-profit that went out as a patient limit and simply sat unfilled. None of
-them raised. All of them produced a log that read like nothing happening.
+take-profit that went out as a patient limit and simply sat unfilled until exits
+learned to cancel a stale limit and close at market. None of them raised. All of
+them produced a log that read like nothing happening.
 
 That is the argument for the journal and for the out-of-process crash alarm. An
 agent that trades twice in a week is indistinguishable from a broken one until

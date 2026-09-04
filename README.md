@@ -13,10 +13,11 @@ and writes down everything it considered — including what it refused and why.
 
 | | |
 | --- | --- |
-| Alpaca paper account number | `PA3B2PDNZ732` |
-| Alpaca account id | `48ebdce5-2b6b-4a96-b13b-3f3c0e34e7c6` |
+| Alpaca paper account number | `PA31QI8P0F0H` |
+| Alpaca account id | `af5eebaf-c644-4a01-abc7-86951499832c` |
 | One-page write-up | **[docs/WRITEUP.md](docs/WRITEUP.md)** — thesis, AI logic, every risk gate, the Alpaca integration, live results, and disclosure of pre-existing work |
 | Alpaca technologies used | Alpaca MCP Server (all market and account reads), Alpaca CLI (all order writes), Alpaca Trading API paper environment, Alpaca Market Data — option chains with Greeks and implied volatility, quotes, bars, corporate news, and the market clock |
+| Live result | +2.36% — equity $102,361, realized +$3,280 over three closed round trips |
 | Tests | 312, no network and no API key required — `pytest -q` |
 
 ---
