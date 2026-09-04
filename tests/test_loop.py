@@ -531,15 +531,52 @@ def test_the_underlying_moving_through_the_stop_closes_the_position(journal):
     assert "against the thesis" in decision.detail
 
 
-def test_premium_noise_no_longer_stops_out_a_live_thesis(journal):
-    """The whole point. Down 30% on premium, but the stock has barely moved and
-    has not reached the level that would say we were wrong."""
+def test_premium_noise_inside_the_budget_does_not_stop_out_a_live_thesis(journal):
+    """Down 21% on premium, the stock barely moved, and the trade has not spent
+    what was budgeted for it. This is the case the underlying stop exists for."""
     from agent.exits import check_exit
     from agent.journal import Holding
     holding = Holding("AAPL261016C00310000", "AAPL", "2026-09-04T00:00:00",
                       "up", 313.0, 15.75, stop_spot=300.0, target_spot=340.0)
-    held = position("AAPL", entry=15.75, current=11.00)      # -30% premium
+    held = position("AAPL", entry=15.75, current=12.50)      # -20.6% premium
     assert check_exit(held, SETTINGS, TODAY, holding=holding, spot=311.0) is None
+
+
+def test_the_premium_floor_closes_even_while_the_thesis_is_alive(journal):
+    """The regression this floor was restored to fix.
+
+    Down 30% with the underlying stop still 3.8% away, the old rule had nothing
+    that could close the position -- it would have run to roughly -50% before the
+    only remaining premium rule fired. Measured on the live book on 4 Sep 2026:
+    Ford sat at -34% with its stop 2.2% away and no rule able to reach it.
+
+    The budget for this trade is spent, so it closes. AAPL has barely moved, so
+    it closes as a collapsed premium and starts no cooldown.
+    """
+    from agent.exits import ExitReason, check_exit
+    from agent.journal import Holding
+    holding = Holding("AAPL261016C00310000", "AAPL", "2026-09-04T00:00:00",
+                      "up", 313.0, 15.75, stop_spot=300.0, target_spot=340.0)
+    held = position("AAPL", entry=15.75, current=11.00)      # -30% premium
+    decision = check_exit(held, SETTINGS, TODAY, holding=holding, spot=311.0)
+    assert decision is not None
+    assert decision.reason is ExitReason.PREMIUM_BACKSTOP
+
+
+def test_the_premium_floor_is_a_stop_loss_when_the_underlying_is_going_wrong():
+    """Ford's actual shape on 4 Sep 2026: entry 14.14, spot 14.59 against a put,
+    stop 14.89. The stock has travelled more than halfway to the stop, so the
+    thesis is genuinely failing and this is an ordinary stop loss -- which does
+    start a cooldown."""
+    from agent.exits import ExitReason, check_exit
+    from agent.journal import Holding
+    holding = Holding("F261016P00015000", "F", "2026-09-02T18:36:00",
+                      "down", 14.14, 1.23, stop_spot=14.89, target_spot=12.64)
+    held = position("F", entry=1.23, current=0.81)           # -34% premium
+    decision = check_exit(held, SETTINGS, TODAY, holding=holding, spot=14.59)
+    assert decision is not None
+    assert decision.reason is ExitReason.STOP_LOSS
+    assert decision.urgent
 
 
 def test_a_large_gain_is_banked_even_before_the_underlying_target():

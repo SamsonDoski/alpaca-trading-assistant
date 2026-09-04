@@ -117,6 +117,12 @@ class Settings:
     # A 25% stop at 2:1 puts the target 50% up and needs about a 33% win rate to
     # break even. The target is derived from the stop, so the two cannot drift
     # apart and silently move that number.
+    #
+    # This is an ABSOLUTE FLOOR on premium, not an alternative to the underlying
+    # stop below -- both run, and the position closes on whichever comes first.
+    # Keying stops only to the underlying let positions travel to an average 52%
+    # premium loss before anything could close them, against sizing that assumed
+    # this number. Measured on the live book, 4 Sep 2026.
     stop_loss_pct: float = 0.25
     reward_to_risk: float = 2.0
 
@@ -129,16 +135,6 @@ class Settings:
 
     # Used only when there is not enough history to measure a range.
     fallback_stop_pct: float = 0.03
-
-    # The premium stop, demoted to a backstop and widened accordingly. As the
-    # primary rule it was wrong: a 25% fall in a 0.65-delta option is under a 2%
-    # move in the underlying, so it fired on noise and on volatility crushes with
-    # the thesis intact -- hardest on the high-volatility names where premium
-    # swings most, which is the opposite of a risk rule.
-    #
-    # At 50% its job is to catch an option gutted by collapsing implied volatility
-    # while the stock did nothing: a broken position, not a losing one.
-    premium_backstop_pct: float = 0.50
 
     # The same idea on the winning side. Stop and target deliberately key to
     # different things: a premium stop fires on noise, so the stop belongs on the
