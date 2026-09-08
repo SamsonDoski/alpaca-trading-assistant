@@ -126,11 +126,110 @@ def test_a_take_profit_close_starts_no_cooldown(journal):
     assert journal.cooling_off(within_days=2) == {}
 
 
-def test_a_cooldown_expires(journal):
+def _session_on(journal, day: date) -> None:
+    """A trading day the agent was awake for.
+
+    Written straight into the table because `record_decision` stamps today's
+    date, and these tests are entirely about which days count.
+    """
+    with journal._connect() as conn:
+        conn.execute(
+            "INSERT INTO decisions (at, day, underlying, approved, reason, gate_trace) "
+            "VALUES (?, ?, 'SPY', 0, 'considered', '[]')",
+            (f"{day.isoformat()}T14:00:00+00:00", day.isoformat()))
+
+
+def test_a_cooldown_expires_after_enough_trading_sessions(journal):
+    journal.record("closed", "AAPL", "AAPL261016C00310000", "stop loss — down 26%",
+                   pnl=-400)
+    closed_on = date.today()
+    _session_on(journal, closed_on + timedelta(days=1))
+    _session_on(journal, closed_on + timedelta(days=2))
+    later = closed_on + timedelta(days=3)
+    assert journal.cooling_off(within_days=2, as_of=later) == {}
+
+
+def test_calendar_days_alone_do_not_expire_a_cooldown(journal):
+    """The regression. Five days passed and the market never opened, so the
+    agent has learned nothing new about the name it was stopped out of."""
     journal.record("closed", "AAPL", "AAPL261016C00310000", "stop loss — down 26%",
                    pnl=-400)
     later = date.today() + timedelta(days=5)
-    assert journal.cooling_off(within_days=2, as_of=later) == {}
+    assert journal.cooling_off(within_days=2, as_of=later) == {"AAPL": 2}
+
+
+def test_a_weekend_and_a_holiday_do_not_burn_a_cooldown(journal):
+    """Exactly what happened to F.
+
+    Stopped out on Friday 4 Sep 2026 and re-bought on Tuesday the 8th -- four
+    calendar days, which cleared a two-day cooldown, but the next trading
+    session, because the 6th was a Sunday and the 7th was Labor Day.
+    """
+    friday, tuesday = date(2026, 9, 4), date(2026, 9, 8)
+    with journal._connect() as conn:
+        conn.execute(
+            "INSERT INTO events (at, day, action, underlying, symbol, detail, pnl) "
+            "VALUES (?, ?, 'closed', 'F', 'F261016P00015000', 'stop loss — down 34%', -1344)",
+            (f"{friday.isoformat()}T19:29:00+00:00", friday.isoformat()))
+    assert journal.cooling_off(within_days=2, as_of=tuesday) == {"F": 2}
+
+
+def test_todays_own_sessions_never_shorten_a_cooldown(journal):
+    """A cooldown must not expire between the first pass of a day and the last.
+
+    Decision rows accumulate through the session, so counting today would make
+    the answer drift as the day went on.
+    """
+    journal.record("closed", "AAPL", "AAPL261016C00310000", "stop loss — down 26%",
+                   pnl=-400)
+    closed_on = date.today()
+    _session_on(journal, closed_on + timedelta(days=1))
+    today = closed_on + timedelta(days=2)
+    for _ in range(20):
+        _session_on(journal, today)
+    assert journal.cooling_off(within_days=2, as_of=today) == {"AAPL": 1}
+
+
+def test_a_position_closed_outside_the_agent_starts_a_cooldown(journal):
+    """The agent did not decide this exit and cannot see why it happened, so it
+    has no basis for concluding the idea is still good."""
+    from agent.journal import Holding
+    holding = Holding("F261016P00015000", "F", "2026-09-02T18:36:00",
+                      "down", 14.14, 1.23, stop_spot=14.89, target_spot=12.64)
+    journal.record_external_close(holding, note="closed by hand")
+    assert journal.cooling_off(within_days=2)["F"] == 2
+
+
+def test_reconciling_clears_a_stale_holding_and_warns(journal):
+    """A position that left the book without the agent closing it leaves a row
+    carrying stop and target levels for a trade that is already over."""
+    from agent.loop import _reconcile_holdings
+    journal.open_holding(occ_symbol="F261016P00015000", underlying="F",
+                         direction="down", entry_spot=14.14, entry_premium=1.23,
+                         stop_spot=14.89, target_spot=12.64)
+    notifier = RecordingNotifier()
+
+    cleared = _reconcile_holdings([], journal, notifier)
+
+    assert cleared == 1
+    assert journal.holding("F261016P00015000") is None
+    assert "alert" in notifier.calls
+    assert journal.cooling_off(within_days=2)["F"] == 2
+
+
+def test_reconciling_leaves_positions_we_still_hold_alone(journal):
+    from agent.loop import _reconcile_holdings
+    journal.open_holding(occ_symbol="AAPL261016C00310000", underlying="AAPL",
+                         direction="up", entry_spot=313.0, entry_premium=15.75,
+                         stop_spot=300.0, target_spot=340.0)
+    notifier = RecordingNotifier()
+
+    cleared = _reconcile_holdings([position("AAPL")], journal, notifier)
+
+    assert cleared == 0
+    assert journal.holding("AAPL261016C00310000") is not None
+    assert notifier.calls == []
+    assert journal.cooling_off(within_days=2) == {}
 
 
 def test_the_journal_records_refusals_not_only_trades(journal):

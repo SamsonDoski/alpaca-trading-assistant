@@ -231,36 +231,92 @@ class Journal:
                 "WHERE occ_symbol = ?", (occ_symbol,)).fetchone()
         return Holding(**dict(row)) if row else None
 
+    def open_holdings(self) -> list[Holding]:
+        """Every position we believe we are holding.
+
+        The table is working state rather than history, so this is what the
+        agent thinks the book is. Comparing it against what the broker actually
+        reports is how a position closed by someone else gets noticed.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT occ_symbol, underlying, opened_at, direction, entry_spot, "
+                "entry_premium, stop_spot, target_spot FROM holdings").fetchall()
+        return [Holding(**dict(row)) for row in rows]
+
+    def record_external_close(self, holding: Holding, *, note: str) -> None:
+        """A position left the book without this agent closing it.
+
+        Someone closed it by hand, or the broker did -- assignment, expiry, a
+        liquidation. Either way the agent's picture of the book was wrong until
+        now, and two things have to happen: the stale `holdings` row goes, and
+        the underlying starts a cooldown.
+
+        **The cooldown is the deliberate part.** The agent did not make this
+        exit and cannot see why it happened, so it has no basis for concluding
+        the idea is still good -- and re-buying a name on the next pass after
+        someone stepped in to close it is exactly the behaviour cooldown exists
+        to prevent. Cooling off is the conservative reading, and the cost of
+        being wrong is a trade skipped rather than a trade repeated.
+        """
+        self.record("closed", holding.underlying, holding.occ_symbol,
+                    f"{_EXTERNAL_PREFIX} -- {note}")
+        self.close_holding(holding.occ_symbol)
+
     # -- reading -----------------------------------------------------------
 
     def cooling_off(self, *, within_days: int, as_of: date | None = None) -> dict[str, int]:
         """Underlyings still inside their post-stop-loss cooldown.
 
-        Returns days remaining per underlying, which is what the gate wants --
-        it can then say "2 days left" rather than making the caller subtract
-        dates to find out.
+        Returns sessions remaining per underlying, which is what the gate wants
+        -- it can then say "2 day(s) left" rather than making the caller work it
+        out.
 
-        Only stop-loss closes count. A take-profit close means the reasoning
-        worked, and re-entering after a win is not the behaviour this rule
-        exists to prevent.
+        **Measured in TRADING SESSIONS, not calendar days, and that distinction
+        is the whole point.** Counting calendar days meant a Friday stop-out was
+        cold by Monday, so the rule did nothing on exactly the days it mattered
+        most. Observed live: F stopped out on Friday 4 Sep 2026 and was re-bought
+        on Tuesday the 8th -- four calendar days, which cleared a two-day
+        cooldown, but the next trading session, because the 7th was Labor Day.
+
+        A session is a day the agent recorded decisions on, which is every day
+        the market was open and the agent was running. That needs no holiday
+        calendar to maintain and cannot drift out of date.
+
+        Only today's *completed* predecessors count. Today itself is excluded so
+        that the answer does not change between the first pass of a day and the
+        last -- decision rows accumulate as the day goes on, and a cooldown that
+        quietly expired at lunchtime would be worse than no cooldown at all.
+
+        Stop losses and externally-closed positions both count. A take-profit
+        does not: the reasoning worked, and re-entering after a win is not the
+        behaviour this rule exists to prevent.
         """
         today = as_of or datetime.now(UTC).date()
-        earliest = (today - timedelta(days=within_days)).isoformat()
+        # Bounded so this does not scan the whole history. Generous, because the
+        # bound is now in sessions and a long agent outage stretches how many
+        # calendar days a handful of sessions can span.
+        floor = (today - timedelta(days=max(30, within_days * 10))).isoformat()
 
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT underlying, MAX(day) AS day FROM events "
-                "WHERE action = 'closed' AND detail LIKE ? AND day >= ? "
+                "WHERE action = 'closed' AND day >= ? "
+                "AND (detail LIKE ? OR detail LIKE ?) "
                 "GROUP BY underlying",
-                (f"{_STOP_PREFIX}%", earliest),
+                (floor, f"{_STOP_PREFIX}%", f"{_EXTERNAL_PREFIX}%"),
             ).fetchall()
 
-        remaining: dict[str, int] = {}
-        for row in rows:
-            elapsed = (today - date.fromisoformat(row["day"])).days
-            left = within_days - elapsed
-            if left > 0:
-                remaining[row["underlying"]] = left
+            remaining: dict[str, int] = {}
+            for row in rows:
+                sessions = conn.execute(
+                    "SELECT COUNT(DISTINCT day) FROM decisions "
+                    "WHERE day > ? AND day < ?",
+                    (row["day"], today.isoformat()),
+                ).fetchone()[0]
+                left = within_days - sessions
+                if left > 0:
+                    remaining[row["underlying"]] = left
         return remaining
 
     def counts_for_day(self, day: date | None = None) -> dict[str, int]:
@@ -322,3 +378,9 @@ class Journal:
 # matches on it. Named rather than repeated so the writer and the reader cannot
 # drift apart -- a cooldown that silently stops matching would be invisible.
 _STOP_PREFIX = "stop loss"
+
+# A position that left the book without the agent closing it. Kept separate from
+# the stop-loss prefix rather than borrowed, because the journal should not
+# report a hand-placed exit as a stop the agent decided on. Both start a
+# cooldown; only one of them is a claim about why the trade ended.
+_EXTERNAL_PREFIX = "closed outside the agent"

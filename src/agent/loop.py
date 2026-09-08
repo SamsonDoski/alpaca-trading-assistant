@@ -71,6 +71,44 @@ class PassResult:
         self.refusals.append((symbol, reason))
 
 
+def _reconcile_holdings(positions: tuple[OpenPosition, ...] | list[OpenPosition],
+                        journal: Journal, notifier: Notifier) -> int:
+    """Notice positions that left the book without this agent closing them.
+
+    The `holdings` table is the agent's own picture of what it owns, written
+    when it opens something and deleted when it closes it. Every exit path in
+    this module keeps the two in step -- but nothing outside this module does.
+    A position closed by hand, assigned, expired or liquidated by the broker
+    leaves the row behind, and the agent goes on believing it holds something
+    it does not.
+
+    That belief is not harmless. The row carries `stop_spot` and `target_spot`
+    computed for a specific trade, so re-entering the same contract inherits
+    levels from a position that is already over. And because no `closed` event
+    was ever written, no cooldown started -- which is how a name that was
+    stopped out by hand gets re-bought on the very next pass.
+
+    Observed live: an F put closed by hand on 4 Sep 2026 left both a stale row
+    and no cooldown behind it.
+
+    Returns how many rows were reconciled, so a caller can tell "nothing to do"
+    from "did nothing".
+    """
+    held = {p.occ_symbol for p in positions}
+    stale = [h for h in journal.open_holdings() if h.occ_symbol not in held]
+
+    for holding in stale:
+        journal.record_external_close(
+            holding, note="the broker no longer reports this position")
+        message = (f"{holding.occ_symbol} left the book without the agent "
+                   f"closing it -- clearing its recorded levels and cooling "
+                   f"off {holding.underlying}")
+        logger.warning(message)
+        notifier.alert(message)
+
+    return len(stale)
+
+
 async def run_pass(
     reader,
     *,
@@ -117,6 +155,12 @@ async def run_pass(
         logger.info("market is closed; nothing to do")
         return result
 
+    # --- 2. Reconcile our picture of the book against the broker's --------
+    # Before any exit is evaluated, because `check_exit` reads the holdings
+    # table and a stale row there is worse than a missing one: it supplies stop
+    # and target levels computed for a trade that is already over.
+    _reconcile_holdings(positions, journal, notifier)
+
     # Exit orders already resting at the broker, by contract. Read before the
     # exit loop because it decides between placing a fresh order and escalating
     # a stale one -- and because without it the same position is sold once per
@@ -127,7 +171,7 @@ async def run_pass(
         logger.warning("could not read resting exit orders: %s", exc)
         resting_exits = {}
 
-    # --- 2. Exits, before anything else ----------------------------------
+    # --- 3. Exits, before anything else ----------------------------------
     for position in positions:
         # The stop is keyed to the underlying, so the underlying's price is
         # needed to evaluate it. Held names never reach the brief stage, so this
@@ -198,7 +242,7 @@ async def run_pass(
         settings=settings,
     )
 
-    # --- 3. Screen, free, before spending anything -----------------------
+    # --- 4. Screen, free, before spending anything -----------------------
     candidates = []
     for symbol in settings.symbols:
         outcome = screen(symbol, ctx)
@@ -213,7 +257,7 @@ async def run_pass(
         await _finish(result, ctx, positions, journal, notifier, executor)
         return result
 
-    # --- 4. Gather and reason, concurrently but bounded ------------------
+    # --- 5. Gather and reason, concurrently but bounded ------------------
     # The bound is the important word. Unlimited fan-out is what killed the
     # agent once the watchlist grew: every symbol's four reads went out at
     # once, the MCP server closed the connection under the load, and the pass
@@ -250,14 +294,14 @@ async def run_pass(
         *(ask_one(brief) for brief in usable))
     result.considered = len(proposals)
 
-    # --- 5. Decide and order, strictly one at a time ---------------------
+    # --- 6. Decide and order, strictly one at a time ---------------------
     # Highest conviction first, so that when slots or cash run out it is the
     # weakest ideas that miss out rather than whichever happened to be later in
     # the watchlist.
     ranked = sorted(zip(usable, proposals, strict=True),
                     key=lambda pair: pair[1].confidence, reverse=True)
 
-    # --- 5a. Authorise every candidate individually ----------------------
+    # --- 6a. Authorise every candidate individually ----------------------
     # Each is judged as if it were the only trade, which deliberately
     # over-approves: slots, cash and concentration are cumulative, and cannot be
     # applied until an order is chosen. That is what the second pass is for.
@@ -275,7 +319,7 @@ async def run_pass(
             group=settings.correlation_groups.get(brief.underlying, brief.underlying),
         ))
 
-    # --- 5b. Order the slate ---------------------------------------------
+    # --- 6b. Order the slate ---------------------------------------------
     free_slots = max(0, settings.max_positions - ctx.committed_slots)
     slate, selection_note = select(slate, backend=selector_backend,
                                    settings=settings, slots=free_slots, today=today)
@@ -285,7 +329,7 @@ async def run_pass(
 
     briefs_by_symbol = {b.underlying: b for b in usable}
 
-    # --- 5c. Walk the order and open, re-authorising as the book fills ---
+    # --- 6c. Walk the order and open, re-authorising as the book fills ---
     for candidate in slate:
         brief = briefs_by_symbol[candidate.underlying]
         proposal = candidate.draft.proposal
