@@ -200,21 +200,96 @@ def test_a_position_closed_outside_the_agent_starts_a_cooldown(journal):
     assert journal.cooling_off(within_days=2)["F"] == 2
 
 
-def test_reconciling_clears_a_stale_holding_and_warns(journal):
-    """A position that left the book without the agent closing it leaves a row
-    carrying stop and target levels for a trade that is already over."""
-    from agent.loop import _reconcile_holdings
-    journal.open_holding(occ_symbol="F261016P00015000", underlying="F",
-                         direction="down", entry_spot=14.14, entry_premium=1.23,
-                         stop_spot=14.89, target_spot=12.64)
-    notifier = RecordingNotifier()
+class ReconcileExecutor:
+    """An executor that knows which contracts filled and which are resting."""
 
-    cleared = _reconcile_holdings([], journal, notifier)
+    def __init__(self, *, filled=(), resting=()):
+        self._filled = set(filled)
+        self._resting = list(resting)
+
+    def open_orders(self):
+        return [{"symbol": s, "side": "buy"} for s in self._resting]
+
+    def bought_contracts(self, *, limit=500):
+        return set(self._filled)
+
+
+def _hold(journal, occ, underlying):
+    journal.open_holding(occ_symbol=occ, underlying=underlying, direction="down",
+                         entry_spot=14.14, entry_premium=1.23,
+                         stop_spot=14.89, target_spot=12.64)
+
+
+def test_reconciling_clears_a_stale_holding_and_warns(journal):
+    """A position that filled and then left the book leaves a row carrying stop
+    and target levels for a trade that is already over."""
+    from agent.loop import _reconcile_holdings
+    _hold(journal, "F261016P00015000", "F")
+    notifier = RecordingNotifier()
+    executor = ReconcileExecutor(filled=["F261016P00015000"])
+
+    cleared = _reconcile_holdings([], journal, notifier, executor)
 
     assert cleared == 1
     assert journal.holding("F261016P00015000") is None
     assert "alert" in notifier.calls
     assert journal.cooling_off(within_days=2)["F"] == 2
+
+
+def test_an_order_that_never_filled_cools_nothing_off(journal):
+    """The regression. Writing the holdings row at submission means a limit that
+    rested unfilled until it expired leaves a row behind -- but there was never
+    a position, so there is nothing to report and nothing to cool off from.
+
+    Seen live on 8 Sep 2026: four such rows, and treating them as closed
+    positions cooled off SLV, GLD and PFE because our own orders had not filled.
+    """
+    from agent.loop import _reconcile_holdings
+    _hold(journal, "SLV261016C00056000", "SLV")
+    notifier = RecordingNotifier()
+    executor = ReconcileExecutor(filled=[])          # never filled
+
+    cleared = _reconcile_holdings([], journal, notifier, executor)
+
+    assert cleared == 1
+    assert journal.holding("SLV261016C00056000") is None
+    assert journal.cooling_off(within_days=2) == {}
+    assert notifier.calls == []
+
+
+def test_a_resting_buy_order_keeps_its_levels(journal):
+    """It may still fill, and clearing the row would strand the position that
+    arrives without the entry level its stop is measured against."""
+    from agent.loop import _reconcile_holdings
+    _hold(journal, "SLV261016C00056000", "SLV")
+    notifier = RecordingNotifier()
+    executor = ReconcileExecutor(filled=[], resting=["SLV261016C00056000"])
+
+    cleared = _reconcile_holdings([], journal, notifier, executor)
+
+    assert cleared == 0
+    assert journal.holding("SLV261016C00056000") is not None
+    assert journal.cooling_off(within_days=2) == {}
+
+
+def test_reconciling_does_nothing_when_the_broker_cannot_be_read(journal):
+    """A partial view would either invent a cooldown or drop levels a live
+    position still needs."""
+    from agent.executor import ExecutionError
+    from agent.loop import _reconcile_holdings
+
+    class Broken(ReconcileExecutor):
+        def open_orders(self):
+            raise ExecutionError("CLI exited 1")
+
+    _hold(journal, "F261016P00015000", "F")
+    notifier = RecordingNotifier()
+
+    cleared = _reconcile_holdings([], journal, notifier, Broken())
+
+    assert cleared == 0
+    assert journal.holding("F261016P00015000") is not None
+    assert journal.cooling_off(within_days=2) == {}
 
 
 def test_reconciling_leaves_positions_we_still_hold_alone(journal):
@@ -223,8 +298,9 @@ def test_reconciling_leaves_positions_we_still_hold_alone(journal):
                          direction="up", entry_spot=313.0, entry_premium=15.75,
                          stop_spot=300.0, target_spot=340.0)
     notifier = RecordingNotifier()
+    executor = ReconcileExecutor(filled=["AAPL261016C00310000"])
 
-    cleared = _reconcile_holdings([position("AAPL")], journal, notifier)
+    cleared = _reconcile_holdings([position("AAPL")], journal, notifier, executor)
 
     assert cleared == 0
     assert journal.holding("AAPL261016C00310000") is not None

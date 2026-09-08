@@ -58,6 +58,20 @@ class NotAPaperAccount(ExecutionError):
     """The configured credentials are not a paper account. Refuse everything."""
 
 
+def _filled_quantity(order: dict) -> float:
+    """How much of an order actually filled, whatever the field looks like.
+
+    The CLI returns these as strings, and an unfilled order may report "0",
+    None, or omit the field entirely. Anything unreadable counts as zero,
+    because the caller is deciding whether a position ever existed and guessing
+    that it did is the expensive direction to be wrong in.
+    """
+    try:
+        return float(order.get("filled_qty") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 @dataclass(frozen=True, slots=True)
 class OrderReceipt:
     """What came back from a submitted order."""
@@ -302,7 +316,34 @@ class CliExecutor:
 
     def open_orders(self) -> list[dict]:
         """Orders that have not yet filled or been cancelled."""
-        payload = self._call("order", "list", "--status", "open")
+        return self._order_rows("open")
+
+    def bought_contracts(self, *, limit: int = 500) -> set[str]:
+        """Contracts a buy order has actually FILLED on.
+
+        Submitting an order and owning the thing it was for are different
+        events, and on this feed they are often days apart or never connected
+        at all: a limit priced off an indicative quote can rest unfilled until
+        it expires. So "we sent a buy for this contract" is not evidence we ever
+        held it, and anything reconciling our records against the broker has to
+        be able to tell the two apart.
+
+        Returns symbols rather than orders because that is the only question
+        being asked of it: did this contract ever reach the book?
+        """
+        return {
+            str(order.get("symbol", ""))
+            for order in self._order_rows("closed", limit=limit)
+            if str(order.get("side", "")).lower() == "buy"
+            and _filled_quantity(order) > 0
+        }
+
+    def _order_rows(self, status: str, *, limit: int | None = None) -> list[dict]:
+        """The CLI's order list, flattened out of whatever shape it came in."""
+        args = ["order", "list", "--status", status]
+        if limit is not None:
+            args += ["--limit", str(limit)]
+        payload = self._call(*args)
         if isinstance(payload, list):
             return payload
         if isinstance(payload, dict):

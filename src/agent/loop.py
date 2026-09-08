@@ -72,32 +72,66 @@ class PassResult:
 
 
 def _reconcile_holdings(positions: tuple[OpenPosition, ...] | list[OpenPosition],
-                        journal: Journal, notifier: Notifier) -> int:
-    """Notice positions that left the book without this agent closing them.
+                        journal: Journal, notifier: Notifier,
+                        executor: CliExecutor) -> int:
+    """Bring the agent's picture of the book back in line with the broker's.
 
-    The `holdings` table is the agent's own picture of what it owns, written
-    when it opens something and deleted when it closes it. Every exit path in
-    this module keeps the two in step -- but nothing outside this module does.
-    A position closed by hand, assigned, expired or liquidated by the broker
-    leaves the row behind, and the agent goes on believing it holds something
-    it does not.
+    The `holdings` table is written when an order is *submitted*, because that
+    is the only moment the underlying's price at the decision is still known --
+    and a stop keyed to the underlying is impossible without it. The cost of
+    writing it then is that a row exists before the position does, and on this
+    feed a limit priced off an indicative quote can rest unfilled until it
+    expires. Nothing outside this module ever removed those rows.
 
-    That belief is not harmless. The row carries `stop_spot` and `target_spot`
-    computed for a specific trade, so re-entering the same contract inherits
-    levels from a position that is already over. And because no `closed` event
-    was ever written, no cooldown started -- which is how a name that was
-    stopped out by hand gets re-bought on the very next pass.
+    So a row with no matching position means one of two quite different things,
+    and treating them alike is worse than not reconciling at all:
 
-    Observed live: an F put closed by hand on 4 Sep 2026 left both a stale row
-    and no cooldown behind it.
+      **The order never filled.** There was no position, nothing was decided,
+      and nothing happened worth reporting. Drop the row and move on.
+
+      **It filled and then left the book** -- closed by hand, assigned, expired,
+      or liquidated. That row is actively dangerous, because it carries
+      `stop_spot` and `target_spot` for a trade that is over, and a re-entry
+      into the same contract would inherit them. It also means no `closed` event
+      was written, so no cooldown started, which is how a name stopped out by
+      hand gets re-bought on the next pass. Observed live: an F put closed by
+      hand on 4 Sep 2026 left exactly that behind.
+
+    The broker's fill history is what separates them. A resting buy order is
+    left alone entirely -- it may still fill, and clearing its row would strand
+    the position that arrives without the levels its stop needs.
 
     Returns how many rows were reconciled, so a caller can tell "nothing to do"
     from "did nothing".
     """
-    held = {p.occ_symbol for p in positions}
-    stale = [h for h in journal.open_holdings() if h.occ_symbol not in held]
+    stale = [h for h in journal.open_holdings()
+             if h.occ_symbol not in {p.occ_symbol for p in positions}]
+    if not stale:
+        return 0
 
+    # If either read fails, do nothing. Reconciling on a partial view would
+    # either invent a cooldown or drop levels a live position still needs, and
+    # both are worse than leaving the table alone for one pass.
+    try:
+        pending = {str(o.get("symbol", "")) for o in executor.open_orders()
+                   if str(o.get("side", "")).lower() == "buy"}
+        filled = executor.bought_contracts()
+    except ExecutionError as exc:
+        logger.warning("could not reconcile holdings against the broker: %s", exc)
+        return 0
+
+    reconciled = 0
     for holding in stale:
+        if holding.occ_symbol in pending:
+            continue
+
+        if holding.occ_symbol not in filled:
+            journal.close_holding(holding.occ_symbol)
+            logger.info("%s never filled; dropping its recorded levels",
+                        holding.occ_symbol)
+            reconciled += 1
+            continue
+
         journal.record_external_close(
             holding, note="the broker no longer reports this position")
         message = (f"{holding.occ_symbol} left the book without the agent "
@@ -105,8 +139,9 @@ def _reconcile_holdings(positions: tuple[OpenPosition, ...] | list[OpenPosition]
                    f"off {holding.underlying}")
         logger.warning(message)
         notifier.alert(message)
+        reconciled += 1
 
-    return len(stale)
+    return reconciled
 
 
 async def run_pass(
@@ -159,7 +194,7 @@ async def run_pass(
     # Before any exit is evaluated, because `check_exit` reads the holdings
     # table and a stale row there is worse than a missing one: it supplies stop
     # and target levels computed for a trade that is already over.
-    _reconcile_holdings(positions, journal, notifier)
+    _reconcile_holdings(positions, journal, notifier, executor)
 
     # Exit orders already resting at the broker, by contract. Read before the
     # exit loop because it decides between placing a fresh order and escalating
