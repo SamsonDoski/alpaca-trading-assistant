@@ -31,9 +31,28 @@ asserted in code with tests that prove they fire:
 
 ## The AI logic
 
-`claude-opus-5`, adaptive thinking, effort `high`, structured output validated
-against a schema before it reaches our code — so there is no JSON scraping and
-no branch deciding what a malformed answer meant.
+**The proposer is a swappable component, and which model sits in it is
+configuration rather than architecture.** `ModelBackend` is the entire contract —
+`ask(system, user)` returns a direction, a conviction and a sentence of reasoning.
+Nothing downstream of it knows or cares which model answered.
+
+Two backends ship, and the difference between them is real enough to state
+plainly rather than paper over:
+
+| Backend | Model | How the answer is validated |
+|---|---|---|
+| Anthropic | `claude-opus-5`, adaptive thinking, effort `high` | Structured output validated against a schema by the API, so a malformed answer is impossible by construction |
+| OpenAI-compatible | Featherless, `deepseek-ai/DeepSeek-R1-0528` | JSON requested in the prompt and parsed defensively, because open models served this way do not all enforce a schema |
+
+**The competition paper account ran the Featherless backend**, on
+`deepseek-ai/DeepSeek-R1-0528`, because the Claude quota for this project was
+exhausted partway through the week. The Anthropic path is the one the proposer
+was designed around and is what the schema claim above refers to; the Featherless
+path is what actually placed the trades reported below.
+
+The safety property is identical either way — a failure means no trade — but the
+failure *rate* is not, and the journal records which backend produced each
+decision so the two can be told apart after the fact.
 
 The model is shown one `MarketBrief` per symbol: 82 sessions of price history
 with trend and range position, the option contracts already filtered to the
@@ -48,8 +67,8 @@ minutes later and there are eight others in the pass. Manufacturing a view from
 weak evidence is the most damaging thing the model can do here.
 
 **It fails closed.** Every failure path — API error, safety refusal, missing
-structured answer, schema violation — returns confidence 0.0, which no gate will
-pass. This is the opposite of the convention for a news filter, where a failed
+structured answer, schema violation on Anthropic, unparseable JSON on Featherless
+— returns confidence 0.0, which no gate will pass. This is the opposite of the convention for a news filter, where a failed
 call should let a trade proceed; there the model is an optional veto, here it
 *is* the decision. A system that traded when its reasoning failed would be a
 random number generator with a brokerage account.
@@ -236,7 +255,8 @@ Per the hackathon FAQ, which permits reuse of a participant's own prior work
 provided it is disclosed.
 
 **Written during the hackathon window:** the entire agent — domain model, gate
-chain, MCP read layer, the Claude proposer, the CLI execution path, exits,
+chain, MCP read layer, the model proposer and its two backends, the CLI
+execution path, exits,
 journal, notifier, the pass loop, scheduling, and the report.
 
 **Carried over from my own earlier personal project**, an options backtesting and

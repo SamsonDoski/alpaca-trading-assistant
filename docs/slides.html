@@ -264,7 +264,7 @@
     <div class="arrow">→</div>
     <div class="node"><div class="lbl">MarketBrief</div><div class="sub">82 sessions of history<br>contracts pre-filtered to<br>delta band + expiry window</div></div>
     <div class="arrow">→</div>
-    <div class="node model"><div class="lbl" style="color:#c58fdb">Claude Opus 5</div><div class="sub">direction · confidence<br>rationale<br>schema-validated</div></div>
+    <div class="node model"><div class="lbl" style="color:#c58fdb">Model proposer</div><div class="sub">direction · confidence<br>rationale<br>swappable backend</div></div>
     <div class="arrow">→</div>
     <div class="node gate"><div class="lbl accent">15 gates</div><div class="sub">6 free entry screens<br>9 order gates<br>reject or shrink only</div></div>
     <div class="arrow">→</div>
@@ -308,7 +308,7 @@ TOOL_OPTION_QUOTE  = <span class="s">"get_option_latest_quote"</span></pre>
 <!-- 4 ---------------------------------------------------------------- -->
 <section class="slide">
   <div class="eyebrow">Feature · The AI logic</div>
-  <h1>A schema, not a parser</h1>
+  <h1>One contract, two backends</h1>
   <div class="rule"></div>
   <div class="cols">
     <div class="col">
@@ -326,8 +326,14 @@ TOOL_OPTION_QUOTE  = <span class="s">"get_option_latest_quote"</span></pre>
     direction: Literal[<span class="s">"up"</span>, <span class="s">"down"</span>, <span class="s">"none"</span>] = Field(...)
     confidence: <span class="k">float</span> = Field(ge=<span class="n">0.0</span>, le=<span class="n">1.0</span>)
     rationale:  <span class="k">str</span>   = Field(max_length=<span class="n">800</span>)</pre>
-      <p class="caption">Structured output validated against the schema by the API. Adaptive
-         thinking, effort <span class="mono">high</span>.</p>
+      <p class="caption"><strong class="accent">Anthropic backend:</strong>
+         <span class="mono">claude-opus-5</span>, adaptive thinking, effort
+         <span class="mono">high</span>, validated against this schema by the API.<br>
+         <strong class="warn">Featherless backend:</strong> JSON requested in the prompt
+         and parsed defensively, because open models served that way do not all enforce a
+         schema. <strong>The competition account ran Featherless on
+         <span class="mono">DeepSeek-R1-0528</span></strong> after the Claude quota was
+         exhausted mid-week.</p>
     </div>
     <div class="col">
       <div class="card">
@@ -345,9 +351,12 @@ TOOL_OPTION_QUOTE  = <span class="s">"get_option_latest_quote"</span></pre>
            number generator with a brokerage account.</p>
       </div>
       <div class="card">
-        <h3 class="accent">Reasoning is captured, not discarded</h3>
-        <p>Summarised thinking is stored with every proposal alongside the outcome.
-           The journal records <em>why</em>, not only <em>what</em>.</p>
+        <h3 class="accent">Which model answered is configuration</h3>
+        <p><span class="mono">ModelBackend</span> is the whole contract —
+           <span class="mono">ask(system, user)</span>. Nothing downstream knows which
+           model replied, so the gates are identical either way. The safety property is
+           the same on both paths: a failure means no trade. The failure <em>rate</em> is
+           not, and the journal records which backend produced each decision.</p>
       </div>
     </div>
   </div>
