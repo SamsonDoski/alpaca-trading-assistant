@@ -30,7 +30,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import UTC, date, datetime, time
+from zoneinfo import ZoneInfo
 
 from agent.domain import MarketBrief, OpenPosition, Proposal
 from agent.entry import decide_entry
@@ -69,6 +70,27 @@ class PassResult:
 
     def note(self, symbol: str, reason: str) -> None:
         self.refusals.append((symbol, reason))
+
+
+_NEW_YORK = ZoneInfo("America/New_York")
+_SESSION_OPEN = time(9, 30)
+_SESSION_CLOSE = time(16, 0)
+
+
+def _inside_regular_session(now: datetime) -> bool:
+    """Whether `now` falls inside regular US options trading hours.
+
+    Only a fallback for when the broker's clock cannot be read, and deliberately
+    blunt: weekdays, 9:30 to 16:00 New York time. It knows nothing about
+    holidays or early closes, which is why the pass that uses it runs exits and
+    nothing else. On a holiday the worst it can do is submit a close the broker
+    refuses; against the alternative -- a real session with no stop checks, which
+    is what actually happened -- that is the cheap mistake.
+    """
+    local = now.astimezone(_NEW_YORK)
+    if local.weekday() >= 5:
+        return False
+    return _SESSION_OPEN <= local.time() < _SESSION_CLOSE
 
 
 def _reconcile_holdings(positions: tuple[OpenPosition, ...] | list[OpenPosition],
@@ -169,18 +191,40 @@ async def run_pass(
     result = PassResult()
 
     # --- 1. See the world -------------------------------------------------
-    # These three must succeed. Guessing at any of them means trading against
-    # an account we cannot actually see.
+    # These two must succeed. Guessing at either means trading against an
+    # account we cannot actually see.
     try:
-        account, positions, is_open = await asyncio.gather(
-            reader.account(), reader.positions(), reader.market_open())
+        account, positions = await asyncio.gather(reader.account(), reader.positions())
     except MarketDataError as exc:
-        message = f"ABORT: cannot read the account ({exc}). No trades this pass."
+        message = (f"ABORT: cannot read the account or positions ({exc}). "
+                   f"No trades this pass.")
         logger.error(message)
         journal.record("alert", "", "", message)
         notifier.alert(message)
         result.errors.append(message)
         return result
+
+    # The clock is read on its own, because it only decides whether to OPEN
+    # anything. It used to be bundled into the read above, so a failure on it
+    # aborted the whole pass -- stop checks included. On 11 Sep 2026 the broker's
+    # clock endpoint returned HTTP 500 for three passes in a row and every open
+    # position went 45 minutes unwatched, over a clock the exits never needed.
+    #
+    # Without it, regular session hours decide instead, and entries are skipped:
+    # closing a position that has hit its stop is always right, while opening one
+    # against a session we could not confirm is not.
+    clock_known = True
+    try:
+        is_open = await reader.market_open()
+    except MarketDataError as exc:
+        clock_known = False
+        is_open = _inside_regular_session(datetime.now(UTC))
+        message = (f"broker clock unavailable ({exc}). Judging the session from "
+                   f"regular hours instead ({'open' if is_open else 'closed'}): "
+                   f"exits run, entries are skipped this pass.")
+        logger.warning(message)
+        journal.record("alert", "", "", message)
+        notifier.alert(message)
 
     result.equity = account.equity
     result.unrealized = sum(p.unrealized_pnl for p in positions)
@@ -276,6 +320,14 @@ async def run_pass(
         pending=pending,
         settings=settings,
     )
+
+    # Exits have run; nothing is opened against a session the broker did not
+    # confirm. Stopping before the screen matters for more than tokens: screening
+    # writes decision rows, and decision rows are how cooldowns count trading
+    # sessions -- a holiday mistaken for a session would quietly shorten one.
+    if not clock_known:
+        await _finish(result, ctx, positions, journal, notifier, executor)
+        return result
 
     # --- 4. Screen, free, before spending anything -----------------------
     candidates = []

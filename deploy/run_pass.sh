@@ -105,7 +105,7 @@ if [ "$STATUS" -ne 0 ]; then
         curl -sS -m 10 -X POST "$WEBHOOK" \
             -H 'Content-Type: application/json' \
             -H 'User-Agent: AlpacaTradingAssistant (+scheduler, 1.0)' \
-            -d "{\"embeds\":[{\"author\":{\"name\":\"[ATA ${PROFILE:-default}]  Pass FAILED\"},\"title\":\"exit ${STATUS} -- stops did not run\",\"description\":\"\`\`\`\n${TAIL}\n\`\`\`\",\"color\":15158332}]}" \
+            -d "{\"embeds\":[{\"author\":{\"name\":\"[ATA ${PROFILE:-default}]  Pass FAILED\"},\"title\":\"exit ${STATUS} -- pass failed, stops may not have run\",\"description\":\"\`\`\`\n${TAIL}\n\`\`\`\",\"color\":15158332}]}" \
             >/dev/null 2>&1 || true
     fi
 fi

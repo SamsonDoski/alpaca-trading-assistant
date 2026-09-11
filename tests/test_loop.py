@@ -913,3 +913,79 @@ def test_the_summary_reports_refusals(journal):
     run(FakeReader(), FakeExecutor(), FakeProposer({"AAPL": (0.1, Direction.UP)}),
         journal, notifier)
     assert notifier.summary["refusals"]
+
+
+class ClockDownReader(FakeReader):
+    """The broker's clock endpoint failing while everything else works --
+    exactly what happened for three passes on 11 Sep 2026."""
+
+    async def market_open(self):
+        raise MarketDataError("Error calling tool 'get_clock': HTTP error 500")
+
+
+def test_a_failed_clock_read_still_runs_the_stops(journal, monkeypatch):
+    """The regression. A 500 on the clock used to abort the whole pass, and every
+    open position went 45 minutes unwatched over a read the exits never needed."""
+    import agent.loop as loop
+    monkeypatch.setattr(loop, "_inside_regular_session", lambda now: True)
+
+    stopped = position("AAPL", entry=15.80, current=11.00)           # -30%
+    reader = ClockDownReader(positions=[stopped])
+    executor = FakeExecutor()
+    notifier = RecordingNotifier()
+
+    result = run(reader, executor, FakeProposer({}), journal, notifier)
+
+    assert result.closed == 1
+    assert result.errors == []            # stops ran, so the alarm must not fire
+    assert "alert" in notifier.calls
+
+
+def test_a_failed_clock_read_opens_nothing(journal, monkeypatch):
+    """Closing a stopped position is always right. Opening one against a session
+    the broker could not confirm is not."""
+    import agent.loop as loop
+    monkeypatch.setattr(loop, "_inside_regular_session", lambda now: True)
+
+    reader = ClockDownReader()
+    proposer = FakeProposer({"AAPL": (0.9, Direction.UP)})
+
+    result = run(reader, FakeExecutor(), proposer, journal, RecordingNotifier())
+
+    assert result.opened == 0
+    assert proposer.asked == []           # not even a model call
+    assert journal.decisions_for_day() == []   # no fake session for cooldowns
+
+
+def test_a_failed_clock_read_outside_hours_does_nothing(journal, monkeypatch):
+    import agent.loop as loop
+    monkeypatch.setattr(loop, "_inside_regular_session", lambda now: False)
+
+    stopped = position("AAPL", entry=15.80, current=11.00)
+    result = run(ClockDownReader(positions=[stopped]), FakeExecutor(),
+                 FakeProposer({}), journal, RecordingNotifier())
+
+    assert result.closed == 0
+    assert result.errors == []
+
+
+def test_a_failed_account_read_still_aborts(journal):
+    """The account and positions are not optional -- trading without them is
+    trading against a book we cannot see."""
+    reader = FakeReader(fail_account=True)
+    result = run(reader, FakeExecutor(), FakeProposer({}), journal, RecordingNotifier())
+    assert result.errors and "cannot read the account or positions" in result.errors[0]
+
+
+@pytest.mark.parametrize("utc, expected", [
+    ("2026-09-11T14:00:00+00:00", True),    # Friday 10:00 New York
+    ("2026-09-11T13:29:00+00:00", False),   # 09:29, a minute before the open
+    ("2026-09-11T13:30:00+00:00", True),    # 09:30 exactly
+    ("2026-09-11T20:00:00+00:00", False),   # 16:00, the close
+    ("2026-09-12T15:00:00+00:00", False),   # Saturday
+    ("2026-01-15T15:00:00+00:00", True),    # 10:00 in winter, UTC-5 not -4
+])
+def test_regular_session_hours(utc, expected):
+    from datetime import datetime
+    from agent.loop import _inside_regular_session
+    assert _inside_regular_session(datetime.fromisoformat(utc)) is expected
