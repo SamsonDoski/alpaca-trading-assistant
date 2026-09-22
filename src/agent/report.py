@@ -138,7 +138,11 @@ def render(journal: Journal, *, account: AccountState | None = None,
     events = journal.recent(limit=25)
 
     considered = sum(1 for d in decisions if d.confidence is not None)
-    opened_today = sum(1 for d in decisions if d.approved)
+    # From fills, not approvals. An approved decision is an order that may never
+    # have reached the book, so counting those overstated what traded.
+    today_events = journal.counts_for_day()
+    opened_today = today_events.get("opened", 0)
+    ordered_today = today_events.get("ordered", 0)
     unrealized = sum(p.unrealized_pnl for p in positions)
 
     parts: list[str] = [
@@ -155,7 +159,7 @@ def render(journal: Journal, *, account: AccountState | None = None,
         ("Unrealised", f"<span class='{'up' if unrealized >= 0 else 'dn'}'>"
                        f"{_money(unrealized, signed=True)}</span>"),
         ("Considered today", str(considered)),
-        ("Opened today", str(opened_today)),
+        ("Filled today", f"{opened_today} of {ordered_today} ordered"),
         ("Realised today", _money(journal.realized_for_day(), signed=True)),
     ]
     parts.append("<div class=stats>")
@@ -215,7 +219,7 @@ def render(journal: Journal, *, account: AccountState | None = None,
                      "<th class=num>Conviction</th><th>Outcome</th></tr>")
         for d in decisions:
             pill = "open" if d.approved else "skip"
-            label = "opened" if d.approved else "declined"
+            label = "ordered" if d.approved else "declined"
             conviction = f"{d.confidence:.2f}" if d.confidence is not None else "&mdash;"
             reasoning = ""
             if d.thinking:

@@ -70,7 +70,7 @@ class Notifier:
                      realized: float, unrealized: float,
                      book: list[tuple[str, float]] | None = None,
                      refusals: list[tuple[str, str]] | None = None,
-                     dry_run: bool = False) -> None:
+                     dry_run: bool = False, ordered: int = 0) -> None:
         """What this pass did, including what it refused to do.
 
         Realised and unrealised are shown separately on purpose. Conflating a
@@ -81,10 +81,17 @@ class Notifier:
         trades makes an agent that did nothing look identical to an agent that
         was not running.
         """
+        # "ordered" only appears when something was sent, and "opened" means
+        # filled. An order that is still resting shows up as ordered here and as
+        # opened on whichever later pass sees it in the book.
+        activity = f"**{considered}** considered · "
+        if ordered:
+            activity += f"**{ordered}** ordered · "
+        activity += (f"**{opened}** opened · **{closed}** closed · "
+                     f"**{open_count}** open")
         lines = [
             f"### ${equity:,.0f} equity  ·  ${available:,.0f} free",
-            f"**{considered}** considered · **{opened}** opened · "
-            f"**{closed}** closed · **{open_count}** open",
+            activity,
             f"realised **{_money(realized, signed=True)}** · "
             f"unrealised **{_money(unrealized, signed=True)}**",
         ]

@@ -126,6 +126,14 @@ def test_a_take_profit_close_starts_no_cooldown(journal):
     assert journal.cooling_off(within_days=2) == {}
 
 
+def _utc_today() -> date:
+    """The journal stamps days in UTC. The local date disagrees for several
+    hours every evening in the US, and a cooldown test built on it fails only
+    when run at night."""
+    from datetime import UTC, datetime
+    return datetime.now(UTC).date()
+
+
 def _session_on(journal, day: date) -> None:
     """A trading day the agent was awake for.
 
@@ -142,7 +150,7 @@ def _session_on(journal, day: date) -> None:
 def test_a_cooldown_expires_after_enough_trading_sessions(journal):
     journal.record("closed", "AAPL", "AAPL261016C00310000", "stop loss — down 26%",
                    pnl=-400)
-    closed_on = date.today()
+    closed_on = _utc_today()
     _session_on(journal, closed_on + timedelta(days=1))
     _session_on(journal, closed_on + timedelta(days=2))
     later = closed_on + timedelta(days=3)
@@ -154,7 +162,7 @@ def test_calendar_days_alone_do_not_expire_a_cooldown(journal):
     agent has learned nothing new about the name it was stopped out of."""
     journal.record("closed", "AAPL", "AAPL261016C00310000", "stop loss — down 26%",
                    pnl=-400)
-    later = date.today() + timedelta(days=5)
+    later = _utc_today() + timedelta(days=5)
     assert journal.cooling_off(within_days=2, as_of=later) == {"AAPL": 2}
 
 
@@ -182,7 +190,7 @@ def test_todays_own_sessions_never_shorten_a_cooldown(journal):
     """
     journal.record("closed", "AAPL", "AAPL261016C00310000", "stop loss — down 26%",
                    pnl=-400)
-    closed_on = date.today()
+    closed_on = _utc_today()
     _session_on(journal, closed_on + timedelta(days=1))
     today = closed_on + timedelta(days=2)
     for _ in range(20):
@@ -989,3 +997,97 @@ def test_regular_session_hours(utc, expected):
     from datetime import datetime
     from agent.loop import _inside_regular_session
     assert _inside_regular_session(datetime.fromisoformat(utc)) is expected
+
+
+# --- Ordered is not opened --------------------------------------------------
+
+class FillsLaterReader(FakeReader):
+    """A book that is empty when the pass starts and holds the contract once
+    the order has gone in -- a marketable limit filling immediately."""
+
+    def __init__(self, *, filled=(), **kwargs):
+        super().__init__(**kwargs)
+        self._after = tuple(filled)
+        self._calls = 0
+
+    async def positions(self):
+        self._calls += 1
+        return self._positions if self._calls == 1 else self._after
+
+
+def _events(journal, action):
+    return [e for e in journal.recent(limit=100) if e.action == action]
+
+
+def test_sending_an_order_does_not_announce_a_position(journal):
+    """The regression. Announcing at submission reported trades that never
+    happened whenever a limit rested unfilled until it expired."""
+    notifier = RecordingNotifier()
+    result = run(FakeReader(), FakeExecutor(),
+                 FakeProposer({"AAPL": (0.9, Direction.UP)}), journal, notifier)
+
+    assert result.ordered == 1
+    assert result.opened == 0
+    assert "opened" not in notifier.calls
+    assert len(_events(journal, "ordered")) == 1
+    assert _events(journal, "opened") == []
+
+
+def test_an_immediate_fill_is_announced_in_the_same_pass(journal):
+    filled = position("AAPL", entry=16.00, current=16.00)
+    notifier = RecordingNotifier()
+    result = run(FillsLaterReader(filled=(filled,)), FakeExecutor(),
+                 FakeProposer({"AAPL": (0.9, Direction.UP)}), journal, notifier)
+
+    assert result.ordered == 1
+    assert result.opened == 1
+    assert notifier.calls.count("opened") == 1
+    opened = _events(journal, "opened")
+    assert len(opened) == 1 and "filled 2 at 16.00" in opened[0].detail
+
+
+def test_a_later_fill_is_announced_once_on_the_pass_that_sees_it(journal):
+    """Ordered on one pass, filled before the next. Announced then -- with what
+    was actually paid -- and never again."""
+    journal.open_holding(occ_symbol="AAPL261016C00310000", underlying="AAPL",
+                         direction="up", entry_spot=313.0, entry_premium=16.00,
+                         stop_spot=300.0, target_spot=340.0)
+    journal.record("ordered", "AAPL", "AAPL261016C00310000", "AAPL call x2")
+    held = position("AAPL", entry=15.90, current=15.90)
+
+    first, second = RecordingNotifier(), RecordingNotifier()
+    a = run(FakeReader(positions=(held,)), FakeExecutor(), FakeProposer({}),
+            journal, first)
+    b = run(FakeReader(positions=(held,)), FakeExecutor(), FakeProposer({}),
+            journal, second)
+
+    assert a.opened == 1 and "opened" in first.calls
+    assert b.opened == 0 and "opened" not in second.calls
+    detail = _events(journal, "opened")[0].detail
+    assert "filled 2 at 15.90" in detail
+    assert "ordered as AAPL call x2" in detail
+
+
+def test_an_order_that_never_fills_is_recorded_but_not_announced(journal):
+    from agent.loop import _reconcile_holdings
+    journal.open_holding(occ_symbol="SLV261016C00056000", underlying="SLV",
+                         direction="up", entry_spot=50.0, entry_premium=4.0,
+                         stop_spot=48.0, target_spot=54.0)
+    notifier = RecordingNotifier()
+
+    _reconcile_holdings([], journal, notifier, ReconcileExecutor(filled=[]))
+
+    assert len(_events(journal, "unfilled")) == 1
+    assert _events(journal, "opened") == []
+    assert notifier.calls == []
+
+
+def test_the_summary_book_holds_only_real_positions(journal):
+    """An unfilled order used to appear in the open book at +$0."""
+    notifier = RecordingNotifier()
+    run(FakeReader(), FakeExecutor(), FakeProposer({"AAPL": (0.9, Direction.UP)}),
+        journal, notifier)
+
+    assert notifier.summary["book"] == []
+    assert notifier.summary["ordered"] == 1
+    assert notifier.summary["opened"] == 0

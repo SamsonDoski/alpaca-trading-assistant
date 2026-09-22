@@ -316,8 +316,8 @@ async def cmd_trade(args) -> int:
         )
 
     print(f"\n  {result.skipped_before_model} screened out before any model call")
-    print(f"  {result.considered} considered · {result.opened} opened · "
-          f"{result.closed} closed")
+    print(f"  {result.considered} considered · {result.ordered} ordered · "
+          f"{result.opened} filled · {result.closed} closed")
 
     if result.refusals:
         print("\n  CONSIDERED AND DECLINED")

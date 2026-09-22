@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     at          TEXT NOT NULL,
     day         TEXT NOT NULL,
-    action      TEXT NOT NULL,   -- opened | closed | alert
+    action      TEXT NOT NULL,   -- ordered | opened | unfilled | closed | alert
+                                 -- ordered = sent to the broker; opened = filled
     underlying  TEXT NOT NULL,
     symbol      TEXT NOT NULL,   -- the OCC contract symbol
     detail      TEXT NOT NULL,
@@ -243,6 +244,49 @@ class Journal:
                 "SELECT occ_symbol, underlying, opened_at, direction, entry_spot, "
                 "entry_premium, stop_spot, target_spot FROM holdings").fetchall()
         return [Holding(**dict(row)) for row in rows]
+
+    def unannounced_fills(self, held: set[str]) -> list[Holding]:
+        """Positions we hold whose fill has not been recorded yet.
+
+        An order and a position are different events. The agent records
+        `ordered` when it sends one, and `opened` only once the broker reports
+        the contract in the book. This finds the gap between the two: a holdings
+        row for a contract the broker now shows as held, with no `opened` event
+        written since that row was created.
+
+        Compared against the row's own timestamp rather than "ever", so buying
+        the same contract a second time is announced again instead of being
+        mistaken for the first fill.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT h.occ_symbol, h.underlying, h.opened_at, h.direction, "
+                "h.entry_spot, h.entry_premium, h.stop_spot, h.target_spot "
+                "FROM holdings h WHERE NOT EXISTS ("
+                "  SELECT 1 FROM events e WHERE e.action = 'opened' "
+                "  AND e.symbol = h.occ_symbol AND e.at >= h.opened_at)").fetchall()
+        return [Holding(**dict(r)) for r in rows if r["occ_symbol"] in held]
+
+    def order_story(self, holding: Holding) -> tuple[str, str]:
+        """What was said about this position when it was ordered.
+
+        The detail line from the `ordered` event and the model's reasoning from
+        the decision that approved it -- both written at submission, and both
+        needed again when the fill is finally announced, possibly a pass later.
+        Empty strings where nothing was recorded, which is the case for anything
+        ordered before fills were tracked separately.
+        """
+        with self._connect() as conn:
+            ordered = conn.execute(
+                "SELECT detail FROM events WHERE action = 'ordered' AND symbol = ? "
+                "AND at >= ? ORDER BY id DESC LIMIT 1",
+                (holding.occ_symbol, holding.opened_at)).fetchone()
+            decision = conn.execute(
+                "SELECT thinking FROM decisions WHERE underlying = ? AND approved = 1 "
+                "AND at <= ? ORDER BY id DESC LIMIT 1",
+                (holding.underlying, holding.opened_at)).fetchone()
+        return ((ordered["detail"] if ordered else ""),
+                (decision["thinking"] or "" if decision else ""))
 
     def record_external_close(self, holding: Holding, *, note: str) -> None:
         """A position left the book without this agent closing it.

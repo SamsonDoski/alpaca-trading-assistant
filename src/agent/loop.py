@@ -60,7 +60,8 @@ class PassResult:
     """What one pass did, for the caller to print and the summary to announce."""
 
     considered: int = 0
-    opened: int = 0
+    ordered: int = 0      # sent to the broker this pass
+    opened: int = 0       # confirmed filled this pass, whenever they were ordered
     closed: int = 0
     skipped_before_model: int = 0
     refusals: list[tuple[str, str]] = field(default_factory=list)
@@ -148,6 +149,11 @@ def _reconcile_holdings(positions: tuple[OpenPosition, ...] | list[OpenPosition]
             continue
 
         if holding.occ_symbol not in filled:
+            # Written down, but not announced: nothing happened to the account.
+            # It is still worth a row, because an order that never fills is a
+            # cost of the feed worth being able to count.
+            journal.record("unfilled", holding.underlying, holding.occ_symbol,
+                           "order expired or was cancelled without filling")
             journal.close_holding(holding.occ_symbol)
             logger.info("%s never filled; dropping its recorded levels",
                         holding.occ_symbol)
@@ -164,6 +170,34 @@ def _reconcile_holdings(positions: tuple[OpenPosition, ...] | list[OpenPosition]
         reconciled += 1
 
     return reconciled
+
+
+def _announce_fills(positions: tuple[OpenPosition, ...] | list[OpenPosition],
+                    journal: Journal, notifier: Notifier) -> int:
+    """Record and announce each ordered position the broker now shows as held.
+
+    Uses the broker's own average entry price and quantity, so the announcement
+    says what was actually paid rather than the limit that was asked for -- on
+    a marketable limit those differ, and the difference is the real cost of the
+    entry.
+
+    Returns how many fills were announced.
+    """
+    by_symbol = {p.occ_symbol: p for p in positions}
+    fills = journal.unannounced_fills(set(by_symbol))
+
+    for holding in fills:
+        held = by_symbol[holding.occ_symbol]
+        cost = held.entry_price * held.quantity * 100
+        ordered, reasoning = journal.order_story(holding)
+        detail = (f"filled {held.quantity} at {held.entry_price:.2f} "
+                  f"(${cost:,.0f})")
+        if ordered:
+            detail += f" — ordered as {ordered}"
+        journal.record("opened", holding.underlying, holding.occ_symbol, detail)
+        notifier.opened(holding.occ_symbol, detail, reasoning=reasoning)
+
+    return len(fills)
 
 
 async def run_pass(
@@ -239,6 +273,10 @@ async def run_pass(
     # table and a stale row there is worse than a missing one: it supplies stop
     # and target levels computed for a trade that is already over.
     _reconcile_holdings(positions, journal, notifier, executor)
+
+    # Orders from earlier passes that have filled since. Announced here rather
+    # than when they were sent, so "opened" means the contract is in the book.
+    result.opened += _announce_fills(positions, journal, notifier)
 
     # Exit orders already resting at the broker, by contract. Read before the
     # exit loop because it decides between placing a fresh order and escalating
@@ -476,21 +514,36 @@ async def run_pass(
             target_spot=target_spot,
         )
 
+        # Recorded as ORDERED, not opened. A limit priced off an indicative quote
+        # can rest unfilled until it expires, and announcing it as a position the
+        # moment it is sent is how the log came to report trades that never
+        # happened. `_announce_fills` says "opened" once the broker shows it.
         detail = (f"{outcome.draft} — {proposal.confidence:.0%} confidence, "
                   f"stop {stop_spot:,.2f} / target {target_spot:,.2f} on "
                   f"{brief.underlying} at {brief.spot:,.2f}. {proposal.rationale}")
-        journal.record("opened", brief.underlying, outcome.draft.contract.occ_symbol,
+        journal.record("ordered", brief.underlying, outcome.draft.contract.occ_symbol,
                        detail)
-        notifier.opened(outcome.draft.contract.occ_symbol, detail,
-                        reasoning=proposal.thinking_summary)
-        result.opened += 1
+        result.ordered += 1
 
         # The account has changed. Rebuilding the context rather than mutating
         # it keeps GateContext frozen, and means the next candidate is judged
         # against the position we just took.
         ctx = _with_new_position(ctx, outcome.draft)
 
-    await _finish(result, ctx, ctx.open_positions, journal, notifier, executor)
+    # The walk above treats every order as a position so the gates judge the next
+    # candidate against it. The summary must not: `ctx.open_positions` includes
+    # orders that may never fill, which is how an unfilled limit came to appear in
+    # the open book at +$0. Read the real book once more, and announce anything
+    # that filled on the spot -- most marketable limits do.
+    book = positions
+    if result.ordered:
+        try:
+            book = await reader.positions()
+            result.opened += _announce_fills(book, journal, notifier)
+        except MarketDataError as exc:
+            logger.warning("could not re-read the book after ordering: %s", exc)
+
+    await _finish(result, ctx, book, journal, notifier, executor)
     return result
 
 
@@ -633,6 +686,7 @@ async def _finish(result: PassResult, ctx: GateContext,
         equity=result.equity,
         available=ctx.account.available - ctx.committed,
         open_count=len(positions),
+        ordered=result.ordered,
         opened=result.opened,
         closed=result.closed,
         considered=result.considered,
