@@ -173,6 +173,42 @@ class OpenPosition:
         return (self.expiry - on).days if self.expiry else None
 
     @property
+    def strike(self) -> float | None:
+        """The strike, read back out of the OCC symbol.
+
+        The last eight digits are the strike in thousandths, so `...P00029000`
+        is a 29.00 strike. Derived rather than stored because the broker already
+        encodes it in the symbol, and a second copy is a second thing that can
+        disagree.
+        """
+        tail = self.occ_symbol[-8:]
+        return int(tail) / 1000 if tail.isdigit() else None
+
+    def intrinsic(self, spot: float | None) -> float | None:
+        """What this contract is worth on exercise alone.
+
+        The floor under any honest price. An American option cannot trade below
+        it for long, because anyone could buy it, exercise, and bank the
+        difference. That makes it the one value a quote can be checked against
+        without trusting the quote.
+
+        Worth having because this feed does produce prices below it. On
+        16 Sep 2026 a PFE 29 put was marked at 0.72 with PFE at 27.40 -- an
+        intrinsic value of 1.60 -- which read as a 49% loss on a position that
+        was ahead, fired the stop, and sold into the same broken bid.
+        """
+        strike = self.strike
+        if spot is None or spot <= 0 or strike is None:
+            return None
+        return max(0.0, (strike - spot) if self.right == "put" else (spot - strike))
+
+    def return_pct_at(self, price: float) -> float:
+        """What the return would be at some price other than the current mark."""
+        if self.entry_price <= 0:
+            return 0.0
+        return (price - self.entry_price) / self.entry_price
+
+    @property
     def direction(self) -> Direction:
         """The view this position expresses.
 

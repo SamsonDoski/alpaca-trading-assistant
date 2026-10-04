@@ -386,6 +386,7 @@ class FakeExecutor:
     def __init__(self, *, fail_open=False, resting=(), fail_orders=False,
                  resting_exits=()):
         self.actions: list[tuple[str, str]] = []
+        self.prices: list[float] = []      # every limit price actually named
         self._fail_open = fail_open
         self._resting = list(resting)
         self._fail_orders = fail_orders
@@ -413,6 +414,7 @@ class FakeExecutor:
 
     def sell_to_close(self, position, limit_price):
         self.actions.append(("sell_limit", position.occ_symbol))
+        self.prices.append(limit_price)
         return self._receipt(position.occ_symbol, position.quantity)
 
     def close_at_market(self, position):
@@ -1091,3 +1093,107 @@ def test_the_summary_book_holds_only_real_positions(journal):
     assert notifier.summary["book"] == []
     assert notifier.summary["ordered"] == 1
     assert notifier.summary["opened"] == 0
+
+
+# --- A quote below intrinsic value is not a price ---------------------------
+
+def put(underlying="PFE", *, strike=29, quantity=27, entry=1.41, current=0.72):
+    occ = f"{underlying}261016P{int(strike*1000):08d}"
+    return OpenPosition(occ, underlying, quantity, entry, current, EXPIRY, right="put")
+
+
+class QuoteReader(FakeReader):
+    def __init__(self, *, quote=(0.70, 0.74), **kwargs):
+        super().__init__(**kwargs)
+        self._quote = quote
+
+    async def option_quote(self, occ_symbol):
+        return self._quote
+
+
+def test_a_mark_below_intrinsic_does_not_fire_the_stop(journal):
+    """PFE, 16 Sep 2026. The put was marked 0.72 with PFE at 27.40, which makes
+    it worth 1.60 on exercise alone. The agent read -48.9%, fired the premium
+    stop and sold into the same broken bid. It was actually ahead."""
+    from agent.exits import check_exit
+    held = put()
+    assert held.intrinsic(27.40) == pytest.approx(1.60)
+    assert check_exit(held, SETTINGS, TODAY, holding=None, spot=27.40) is None
+
+
+def test_a_real_loss_still_fires_the_stop(journal):
+    """The floor must not become a way to never stop out. Here the underlying
+    really did move: the put is nearly worthless because PFE rallied."""
+    from agent.exits import ExitReason, check_exit
+    held = put(current=0.72)
+    decision = check_exit(held, SETTINGS, TODAY, holding=None, spot=31.00)
+    assert decision is not None and decision.reason is ExitReason.STOP_LOSS
+
+
+def test_a_broken_quote_is_closed_at_intrinsic_not_at_market(journal):
+    from agent.loop import _close
+    from agent.exits import ExitDecision, ExitReason
+    executor = FakeExecutor()
+    decision = ExitDecision(put(), ExitReason.STOP_LOSS, "down -48.9%")
+
+    asyncio.run(_close(decision, QuoteReader(quote=(0.72, 0.80)), executor, journal,
+                       RecordingNotifier(), SETTINGS, spot=27.40))
+
+    assert ("sell_market", decision.position.occ_symbol) not in executor.actions
+    assert ("sell_limit", decision.position.occ_symbol) in executor.actions
+    assert executor.prices[-1] == pytest.approx(1.58)   # intrinsic less two cents
+
+
+def test_a_sane_quote_still_closes_a_stop_at_market(journal):
+    """A stop that rests unfilled while the price falls is the failure this
+    system already paid for. The floor only applies to a broken quote."""
+    from agent.loop import _close
+    from agent.exits import ExitDecision, ExitReason
+    executor = FakeExecutor()
+    held = put(current=1.00)
+    decision = ExitDecision(held, ExitReason.STOP_LOSS, "down -29%")
+
+    asyncio.run(_close(decision, QuoteReader(quote=(1.90, 2.00)), executor, journal,
+                       RecordingNotifier(), SETTINGS, spot=27.40))
+
+    assert ("sell_market", held.occ_symbol) in executor.actions
+
+
+def test_an_out_of_the_money_contract_has_no_floor(journal):
+    held = put(strike=25)
+    assert held.intrinsic(27.40) == 0.0
+
+
+# --- The exits-only pass ----------------------------------------------------
+
+def test_an_exits_only_pass_closes_but_never_opens(journal):
+    stopped = position("AAPL", entry=20.00, current=15.00)
+    executor = FakeExecutor()
+    proposer = FakeProposer({"MSFT": (0.9, Direction.UP)})
+
+    result = run(FakeReader(positions=(stopped,),
+                            candidates=(contract("AAPL"), contract("MSFT"))),
+                 executor, proposer, journal, RecordingNotifier(), exits_only=True)
+
+    assert result.closed == 1
+    assert result.ordered == 0
+    assert proposer.asked == []
+    assert "buy" not in [action for action, _ in executor.actions]
+
+
+def test_an_exits_only_pass_writes_no_decision_rows(journal):
+    """Decision rows are how cooldowns count trading sessions. Running these
+    between the full passes must not make a day look like several."""
+    run(FakeReader(positions=(position("AAPL", entry=20.00, current=15.00),)),
+        FakeExecutor(), FakeProposer({}), journal, RecordingNotifier(),
+        exits_only=True)
+    assert journal.decisions_for_day() == []
+
+
+def test_an_exits_only_pass_posts_no_summary(journal):
+    """Three of these run between every full pass. A summary each time would
+    bury the messages that matter."""
+    notifier = RecordingNotifier()
+    run(FakeReader(), FakeExecutor(), FakeProposer({}), journal, notifier,
+        exits_only=True)
+    assert "summary" not in notifier.calls

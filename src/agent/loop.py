@@ -211,6 +211,7 @@ async def run_pass(
     today: date | None = None,
     ignore_clock: bool = False,
     trading_halted: bool = False,
+    exits_only: bool = False,
     selector_backend=None,
 ) -> PassResult:
     """Run one complete pass and return what it did.
@@ -220,6 +221,14 @@ async def run_pass(
     executor and a proposer wired to a canned answer, and can then assert on
     the sequence of things that happened without a network, an account, or a
     single token spent.
+
+    **`exits_only` runs the managing half and stops.** Entries are the expensive
+    part -- a model call per candidate -- while exits are a handful of broker
+    reads and some arithmetic. That asymmetry means the stop can be checked far
+    more often than new positions are looked for, and it should be: the gap
+    between passes is how far a position travels unwatched, and measured over
+    81 round trips, losses that overshot the stop while the market was open cost
+    $3,847 beyond where the rule said to exit.
     """
     today = today or date.today()
     result = PassResult()
@@ -303,7 +312,8 @@ async def run_pass(
             continue
         try:
             await _close(decision, reader, executor, journal, notifier, settings,
-                         stale_order=resting_exits.get(position.occ_symbol))
+                         stale_order=resting_exits.get(position.occ_symbol),
+                         spot=spot)
             result.closed += 1
         except ExecutionError as exc:
             message = f"failed to close {position.occ_symbol}: {exc}"
@@ -320,6 +330,14 @@ async def run_pass(
             account, positions = await asyncio.gather(reader.account(), reader.positions())
         except MarketDataError as exc:
             logger.warning("could not re-read after closing: %s", exc)
+
+    if exits_only:
+        # Everything that manages open risk has now run. Stop before the entry
+        # machinery: no gate context, no screening, no model calls -- and no
+        # decision rows, which is what keeps these extra passes from counting as
+        # extra trading sessions when a cooldown measures them.
+        logger.info("exits-only pass: %d closed", result.closed)
+        return result
 
     if trading_halted:
         # Announced on every pass it is on. A silent freeze looks exactly like a
@@ -564,42 +582,74 @@ async def _resting_exit_orders(executor: CliExecutor) -> dict[str, str]:
     return resting
 
 
+def _protective_floor(position: OpenPosition, quote, spot: float | None) -> float | None:
+    """A limit to use instead of a market order, when the quote cannot be real.
+
+    An American option is worth at least its intrinsic value -- anyone could buy
+    it, exercise, and bank the difference -- so a bid below that is a broken
+    quote rather than a price. This feed produces them: on 16 Sep 2026 a PFE 29
+    put was bid 0.72 with PFE at 27.40, worth 1.60 on exercise alone. The stop
+    fired on that mark and a market order sold into the same bid, booking -48.9%
+    on a position that was ahead.
+
+    Returns a price only in that case. The two cents below intrinsic is slack
+    for a real buyer to meet; against a broken bid it simply will not fill,
+    which is the point. The position stays, the next pass looks again, and
+    nothing was given away.
+
+    Returns None whenever the quote is sane, or the contract is out of the money
+    and has no intrinsic value to check against. Then the normal rules apply --
+    a stop still goes out at market, because a stop that sits unfilled while the
+    price falls is the failure this system has already paid for once.
+    """
+    intrinsic = position.intrinsic(spot)
+    if intrinsic is None or intrinsic <= 0:
+        return None
+
+    bid = quote[0] if quote else None
+    if bid is not None and bid >= intrinsic:
+        return None
+
+    return round(intrinsic - 0.02, 2)
+
+
 async def _close(decision: ExitDecision, reader, executor: CliExecutor,
                  journal: Journal, notifier: Notifier, settings: Settings,
-                 *, stale_order: str | None = None) -> None:
+                 *, stale_order: str | None = None,
+                 spot: float | None = None) -> None:
     """Close one position, patiently or immediately depending on why.
 
     **A resting exit order means last pass's limit did not fill**, and the
     correct response is to escalate rather than to wait again or to stack a
-    second order on top. The limit is cancelled and the position closed at
-    market.
+    second order on top. The limit is cancelled and replaced with one that is
+    marketable now.
 
     That is the same lesson the stop path already learned the expensive way: a
     missed exit is not harmless. It applies to winners too -- an unfilled
     take-profit is a gain that has not been banked, and on this data feed a
     patient limit can sit unfilled for the rest of the session.
+
+    What neither path does any more is name no price at all. See `_floor_price`.
     """
     position = decision.position
+    quote = await reader.option_quote(position.occ_symbol)
+    floor = _protective_floor(position, quote, spot)
 
-    if stale_order:
+    if floor is not None:
+        # The quote is below what the contract is worth on exercise. Whatever
+        # the reason for closing, refuse to hand it over at that price.
+        if stale_order:
+            executor.cancel(stale_order)
+        receipt = executor.sell_to_close(position, floor)
+        how = (f"limit {floor:.2f}, holding out for intrinsic value -- the "
+               f"quote is below what exercise alone is worth")
+    elif stale_order:
         logger.info("escalating %s: previous exit limit did not fill",
                     position.occ_symbol)
         executor.cancel(stale_order)
         receipt = executor.close_at_market(position)
-        pnl = position.unrealized_pnl
-        detail = (f"{_detail_prefix(decision)} — {decision.detail}, "
-                  f"escalated to market after the limit did not fill. "
-                  f"P&L ${pnl:+,.0f} ({position.return_pct:+.1%}) "
-                  f"[{receipt.client_order_id}]")
-        journal.record("closed", position.underlying, position.occ_symbol,
-                       detail, pnl=pnl)
-        journal.close_holding(position.occ_symbol)
-        notifier.closed(position.occ_symbol, detail, won=pnl > 0)
-        return
-
-    quote = await reader.option_quote(position.occ_symbol)
-
-    if decision.urgent or quote is None:
+        how = "escalated to market after the limit did not fill"
+    elif decision.urgent or quote is None:
         # Either the position is running away from us, or nobody is quoting it
         # and there is no limit price worth naming. Both mean: take what the
         # market gives rather than sit on an unfillable order.

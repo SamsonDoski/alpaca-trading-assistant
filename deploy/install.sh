@@ -132,9 +132,26 @@ fi
 # instant. Both accounts hitting the MCP server and the model simultaneously
 # doubles the peak load for no benefit; staggering costs nothing.
 MINUTES="*/15"
-[[ -n "$PROFILE" ]] && MINUTES="5,20,35,50"
+EXIT_MINUTES="5,10,20,25,35,40,50,55"
+if [[ -n "$PROFILE" ]]; then
+    MINUTES="5,20,35,50"
+    EXIT_MINUTES="0,10,15,25,30,40,45,55"
+fi
 
+# Two schedules per profile, and the minutes must not overlap.
+#
+# The full pass costs a model call per candidate. The exits-only pass costs a
+# handful of broker reads, so it can run far more often -- and should: the gap
+# between passes is how far a position travels unwatched, and across 81 round
+# trips, losses that overshot the stop while the market was open cost $3,847
+# beyond where the rule said to exit.
+#
+# They share this profile's lock, which is what makes the pair safe. It is also
+# why the minute lists are disjoint rather than EXIT_MINUTES being */5: if both
+# fired at once, the exits pass could take the lock first and the full pass
+# would skip, so entries would quietly stop happening.
 LINE="${MINUTES} ${START_HOUR}-${END_HOUR} * * 1-5 ${PROJECT_DIR}/deploy/run_pass.sh${PROFILE_ARG}${LIVE_FLAG}"
+EXIT_LINE="${EXIT_MINUTES} ${START_HOUR}-${END_HOUR} * * 1-5 ${PROJECT_DIR}/deploy/run_pass.sh${PROFILE_ARG}${LIVE_FLAG} --exits-only"
 chmod +x "${PROJECT_DIR}/deploy/run_pass.sh"
 
 # Replace only THIS profile's line. Two lines for one profile would mean two
@@ -150,15 +167,20 @@ chmod +x "${PROJECT_DIR}/deploy/run_pass.sh"
 # an empty one cannot match a line carrying `--profile something`. `--live` is
 # excluded from the pattern deliberately: a profile switching between dry run
 # and live must still replace its own line rather than stack a second one.
+#
+# The pattern also has to cover this profile's exits-only line, so that
+# reinstalling replaces both rather than leaving last install's copy behind.
 BEFORE="$(crontab -l 2>/dev/null || true)"
 KEEP="$(printf '%s\n' "$BEFORE" \
-    | grep -v -E "run_pass\.sh${PROFILE_ARG}( --live)?[[:space:]]*$" \
+    | grep -v -E "run_pass\.sh${PROFILE_ARG}( --live)?( --exits-only)?[[:space:]]*$" \
     | grep -v "^CRON_TZ=" || true)"
 
-printf '%s\n%s\n' "$KEEP" "$LINE" | grep -v '^$' | crontab -
+printf '%s\n%s\n%s\n' "$KEEP" "$LINE" "$EXIT_LINE" | grep -v '^$' | crontab -
 
 crontab -l | grep -qF "$LINE" || fail "the crontab entry did not take"
+crontab -l | grep -qF "$EXIT_LINE" || fail "the exits-only entry did not take"
 echo "    installed: $LINE"
+echo "    installed: $EXIT_LINE"
 
 # Every other profile's line must have survived. Counting them is cheap and it
 # is the only check that would have caught the default account being unscheduled.

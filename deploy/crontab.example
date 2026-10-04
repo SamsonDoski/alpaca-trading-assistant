@@ -34,8 +34,23 @@ CRON_TZ=UTC
 PATH=/usr/local/bin:/usr/bin:/bin
 SHELL=/bin/bash
 
-# min  hour   dom mon dow   command
-*/15   13-20  *   *   1-5   PROJECT_DIR/deploy/run_pass.sh
+# ---------------------------------------------------------------------------
+# TWO SCHEDULES, AND WHY THE MINUTES MUST NOT OVERLAP
+#
+# The full pass costs a model call per candidate. The exits-only pass costs a
+# few broker reads and no tokens at all, so it runs between the full ones. The
+# gap between passes is how far a position can travel unwatched: measured over
+# 81 round trips, losses that overshot the stop while the market was open cost
+# $3,847 beyond where the rule said to exit.
+#
+# Both lines take the same per-profile lock, which is what keeps them from
+# colliding. It is also why the second line lists minutes explicitly instead of
+# */5 -- if both fired on the same minute, the exits pass could take the lock
+# first and the full pass would skip, so entries would quietly stop happening.
+# ---------------------------------------------------------------------------
 
-# For the competition, replace that line with:
-# */15   13-20  *   *   1-5   PROJECT_DIR/deploy/run_pass.sh --live
+# min                      hour   dom mon dow   command
+*/15                       13-20  *   *   1-5   PROJECT_DIR/deploy/run_pass.sh
+5,10,20,25,35,40,50,55     13-20  *   *   1-5   PROJECT_DIR/deploy/run_pass.sh --exits-only
+
+# For live trading, add --live to the end of both lines.

@@ -278,11 +278,18 @@ async def cmd_trade(args) -> int:
     from agent.notify import Notifier
     from agent.proposer import Proposer
 
-    try:
-        backend = build_backend()
-    except ModelUnavailable as exc:
-        print(f"  [stop] {exc}")
-        return 1
+    exits_only = getattr(args, "exits_only", False)
+
+    # No model is built for an exits-only pass, and that is worth more than the
+    # saved tokens: it means a stop still fires when the model provider is down,
+    # which used to abort the pass before a single position was looked at.
+    backend = None
+    if not exits_only:
+        try:
+            backend = build_backend()
+        except ModelUnavailable as exc:
+            print(f"  [stop] {exc}")
+            return 1
 
     settings = load_settings(args.config)
     executor = CliExecutor(dry_run=not args.live)
@@ -290,6 +297,8 @@ async def cmd_trade(args) -> int:
     journal = Journal()
 
     mode = "LIVE on the paper account" if args.live else "DRY RUN -- nothing will be sent"
+    if exits_only:
+        mode += "  [exits only]"
     # The profile is named on every pass. With two accounts running from one
     # copy of the code, a log line that does not say which account it belongs to
     # is a log line you cannot act on.
@@ -297,16 +306,17 @@ async def cmd_trade(args) -> int:
     print(f"  {len(settings.symbols)} symbols, "
           f"{settings.stop_loss_pct:.0%} stop / {settings.take_profit_pct:.0%} target "
           f"({settings.break_even_win_rate:.0%} break-even win rate)")
-    print(f"  model: {backend.name}")
+    print(f"  model: {backend.name if backend else 'none -- exits need no opinion'}")
 
     async with open_reader() as reader:
         result = await run_pass(
             reader,
             settings=settings,
             executor=executor,
-            proposer=Proposer(backend),
+            proposer=Proposer(backend) if backend else None,
             journal=journal,
             notifier=notifier,
+            exits_only=exits_only,
             ignore_clock=args.ignore_clock,
             trading_halted=os.getenv("TRADING_HALTED", "").lower() in ("true", "1", "yes"),
             # Same backend for selection. A different one would be defensible --
@@ -315,9 +325,12 @@ async def cmd_trade(args) -> int:
             selector_backend=backend,
         )
 
-    print(f"\n  {result.skipped_before_model} screened out before any model call")
-    print(f"  {result.considered} considered · {result.ordered} ordered · "
-          f"{result.opened} filled · {result.closed} closed")
+    if exits_only:
+        print(f"\n  {result.closed} closed")
+    else:
+        print(f"\n  {result.skipped_before_model} screened out before any model call")
+        print(f"  {result.considered} considered · {result.ordered} ordered · "
+              f"{result.opened} filled · {result.closed} closed")
 
     if result.refusals:
         print("\n  CONSIDERED AND DECLINED")
@@ -561,6 +574,9 @@ def main() -> int:
                        help="actually place orders (default is a dry run)")
     trade.add_argument("--ignore-clock", action="store_true",
                        help="run as if the market were open")
+    trade.add_argument("--exits-only", action="store_true",
+                       help="manage open positions and stop; no model call, "
+                            "no new entries. Cheap enough to run between passes")
     trade.set_defaults(func=cmd_trade)
 
     sub.add_parser("notify-test", help="check the Discord webhook works").set_defaults(

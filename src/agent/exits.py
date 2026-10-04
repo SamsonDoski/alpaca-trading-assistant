@@ -105,12 +105,26 @@ def check_exit(position: OpenPosition, settings: Settings, today: date,
 
     ret = position.return_pct
 
+    # A mark below intrinsic value is a broken quote, not a loss, and this feed
+    # produces them. So the LOSS side is judged against whichever is higher,
+    # while gains are still judged on the mark alone.
+    #
+    # The asymmetry is deliberate. Refusing to sell on a price that cannot be
+    # real costs nothing -- the position is still there next pass. Taking a
+    # PROFIT on intrinsic would mean claiming a gain at a price nobody is
+    # currently offering, and then selling into that same thin book.
+    intrinsic = position.intrinsic(spot)
+    if intrinsic is not None and intrinsic > position.current_price:
+        ret_for_stops = position.return_pct_at(intrinsic)
+    else:
+        ret_for_stops = ret
+
     # --- the floor, checked before anything else --------------------------
     #
     # Whatever the underlying is doing, the budget for this trade is spent. The
     # only judgement left is what to CALL it, because a stop loss starts a
     # cooldown and a collapsed premium does not.
-    if ret <= -settings.stop_loss_pct:
+    if ret_for_stops <= -settings.stop_loss_pct:
         if holding is None or spot is None or spot <= 0:
             return ExitDecision(
                 position, ExitReason.STOP_LOSS,
