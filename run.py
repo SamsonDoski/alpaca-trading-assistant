@@ -345,6 +345,35 @@ async def cmd_trade(args) -> int:
     return 0
 
 
+async def cmd_metrics(args) -> int:
+    """Dump what every order was judged on, as CSV.
+
+    Outcomes are deliberately not joined in here. They live at the broker, and
+    the contract symbol is the key -- so this stays a faithful record of what
+    was known at the decision, and pairing it with what happened afterwards is
+    a separate step that cannot accidentally rewrite history.
+    """
+    import csv
+
+    from agent.journal import Journal
+
+    rows = Journal().entry_metrics()
+    if not rows:
+        print("  no orders recorded yet -- this fills up as the agent trades")
+        return 0
+
+    out = open(args.output, "w", newline="", encoding="utf-8") if args.output else sys.stdout
+    try:
+        writer = csv.DictWriter(out, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    finally:
+        if args.output:
+            out.close()
+            print(f"  {len(rows)} orders written to {args.output}")
+    return 0
+
+
 async def cmd_notify_test(args) -> int:
     """Send a probe to the Discord webhook and report the real result."""
     from agent.notify import Notifier
@@ -578,6 +607,10 @@ def main() -> int:
                        help="manage open positions and stop; no model call, "
                             "no new entries. Cheap enough to run between passes")
     trade.set_defaults(func=cmd_trade)
+
+    metrics = sub.add_parser("metrics", help="what every order was judged on, as CSV")
+    metrics.add_argument("--output", default=None, help="write to a file instead of stdout")
+    metrics.set_defaults(func=cmd_metrics)
 
     sub.add_parser("notify-test", help="check the Discord webhook works").set_defaults(
         func=cmd_notify_test)

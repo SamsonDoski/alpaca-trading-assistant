@@ -65,6 +65,52 @@ CREATE TABLE IF NOT EXISTS holdings (
     target_spot  REAL NOT NULL
 );
 
+-- The numbers behind an order, written when it is sent.
+--
+-- `decisions` already records WHY something was refused, which is what you want
+-- while watching a pass. It records nothing measurable about what was ALLOWED,
+-- and that turned out to be the binding constraint on improving this system.
+--
+-- Pairing the model's stated confidence against outcomes found a real effect
+-- worth roughly $10,000 -- and that analysis was only possible because
+-- confidence happened to be stored. The same question could not be asked of the
+-- spread paid, the implied volatility, the delta or the days to expiry, because
+-- none of them survived the pass that used them.
+--
+-- So every number a gate judged is kept, whether or not anything reads it
+-- today. The cost is a row per order; the alternative is discovering in a month
+-- that the one column needed was the one not written.
+CREATE TABLE IF NOT EXISTS entry_metrics (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    at             TEXT NOT NULL,
+    day            TEXT NOT NULL,
+    occ_symbol     TEXT NOT NULL,
+    underlying     TEXT NOT NULL,
+    direction      TEXT NOT NULL,
+    confidence     REAL,
+    quantity       INTEGER,
+    limit_price    REAL,       -- what we asked to pay, per share
+    cost           REAL,       -- the whole position
+    spot           REAL,       -- the underlying when the decision was made
+    strike         REAL,
+    days_to_expiry INTEGER,
+    delta          REAL,
+    implied_vol    REAL,
+    realized_vol   REAL,
+    iv_to_realized REAL,       -- what premium_richness judged
+    spread_pct     REAL,       -- what spread_width judged
+    daily_decay    REAL,       -- what decay_burden judged
+    open_interest  INTEGER,
+    atr_pct        REAL,
+    range_position REAL,       -- 0 = at the 82-day low, 1 = at the high
+    change_5d      REAL,
+    change_20d     REAL,
+    change_60d     REAL,
+    stop_spot      REAL,
+    target_spot    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_symbol ON entry_metrics(occ_symbol);
+
 CREATE TABLE IF NOT EXISTS decisions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     at          TEXT NOT NULL,
@@ -193,6 +239,33 @@ class Journal:
                  proposal.thinking_summary if proposal else None,
                  encoded),
             )
+
+    def record_entry_metrics(self, **fields) -> None:
+        """Store the measured inputs behind one order.
+
+        Takes keywords rather than a long positional signature so that adding a
+        column later does not break the call site, and so a caller that cannot
+        compute something simply omits it rather than passing a placeholder that
+        later reads as a measurement.
+        """
+        now = datetime.now(UTC)
+        fields = {"at": now.isoformat(), "day": now.date().isoformat(), **fields}
+        columns = ", ".join(fields)
+        placeholders = ", ".join("?" for _ in fields)
+        with self._connect() as conn:
+            conn.execute(
+                f"INSERT INTO entry_metrics ({columns}) VALUES ({placeholders})",
+                tuple(fields.values()))
+
+    def entry_metrics(self, occ_symbol: str | None = None) -> list[dict]:
+        """Every recorded order, or just the ones for a contract."""
+        sql = "SELECT * FROM entry_metrics"
+        args: tuple = ()
+        if occ_symbol:
+            sql += " WHERE occ_symbol = ?"
+            args = (occ_symbol,)
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(sql + " ORDER BY id", args)]
 
     def open_holding(self, *, occ_symbol: str, underlying: str, direction: str,
                      entry_spot: float, entry_premium: float,

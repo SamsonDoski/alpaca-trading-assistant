@@ -11,6 +11,7 @@ docstring.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import date, timedelta
 
 import pytest
@@ -1197,3 +1198,60 @@ def test_an_exits_only_pass_posts_no_summary(journal):
     run(FakeReader(), FakeExecutor(), FakeProposer({}), journal, notifier,
         exits_only=True)
     assert "summary" not in notifier.calls
+
+
+# --- Instrumentation: the numbers behind an order ---------------------------
+
+def test_every_order_records_what_the_gates_judged(journal):
+    """The confidence finding was only possible because confidence happened to
+    be stored. Spread, implied volatility, delta and expiry were computed, used
+    and thrown away. Now they are kept."""
+    run(FakeReader(), FakeExecutor(), FakeProposer({"AAPL": (0.9, Direction.UP)}),
+        journal, RecordingNotifier())
+
+    rows = journal.entry_metrics()
+    assert len(rows) == 1
+    row = rows[0]
+
+    assert row["underlying"] == "AAPL"
+    assert row["direction"] == "up"
+    assert row["confidence"] == pytest.approx(0.9)
+    assert row["strike"] == pytest.approx(310.0)
+    assert row["delta"] == pytest.approx(0.65)
+    assert row["implied_vol"] == pytest.approx(0.20)
+    assert row["open_interest"] == 900
+    assert row["spread_pct"] is not None and row["spread_pct"] > 0
+    assert row["days_to_expiry"] == (EXPIRY - TODAY).days
+    # The brief's own spot -- the last close the model was shown -- not whatever
+    # the stock is worth now. It has to match what stop_and_target measured from.
+    assert row["spot"] == pytest.approx(brief_spot := 310.0)
+    assert row["stop_spot"] < brief_spot < row["target_spot"]   # a long call
+    assert row["realized_vol"] is not None
+    assert row["iv_to_realized"] is not None
+    assert row["stop_spot"] is not None and row["target_spot"] is not None
+
+
+def test_metrics_are_recorded_for_the_order_not_the_fill(journal):
+    """An order that never fills still reflects a judgement that was made, and
+    whether unfilled orders differ from filled ones is worth being able to ask."""
+    result = run(FakeReader(), FakeExecutor(),
+                 FakeProposer({"AAPL": (0.9, Direction.UP)}), journal,
+                 RecordingNotifier())
+    assert result.ordered == 1 and result.opened == 0
+    assert len(journal.entry_metrics()) == 1
+
+
+def test_a_broken_recorder_cannot_stop_a_trade(journal, monkeypatch):
+    """Measurement must never be able to block a trade the gates approved."""
+    def boom(**kwargs):
+        raise sqlite3.OperationalError("disk is full")
+
+    monkeypatch.setattr(journal, "record_entry_metrics", boom)
+    executor = FakeExecutor()
+    result = run(FakeReader(), executor,
+                 FakeProposer({"AAPL": (0.9, Direction.UP)}), journal,
+                 RecordingNotifier())
+
+    assert result.ordered == 1
+    assert ("buy", "AAPL261016C00310000") in executor.actions
+    assert result.errors == []

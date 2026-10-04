@@ -47,7 +47,7 @@ from agent.gates import GateContext, screen
 from agent.journal import Journal
 from agent.market import MarketDataError, build_brief
 from agent.notify import Notifier
-from agent.pricing import average_true_range_pct
+from agent.pricing import average_true_range_pct, daily_decay_pct, premium_richness
 from agent.proposer import Proposer
 from agent.selector import Candidate, select
 from agent.settings import Settings
@@ -170,6 +170,60 @@ def _reconcile_holdings(positions: tuple[OpenPosition, ...] | list[OpenPosition]
         reconciled += 1
 
     return reconciled
+
+
+def _record_entry_metrics(journal: Journal, draft, brief: MarketBrief, proposal,
+                          settings: Settings, *, today: date,
+                          stop_spot: float, target_spot: float,
+                          atr_pct: float | None) -> None:
+    """Write down every number that was weighed, at the moment it was weighed.
+
+    None of this is read back today. It exists because the one question this
+    system could answer about itself -- does the model's confidence predict
+    anything? -- was answerable only because confidence happened to be stored,
+    and the answer was worth about $10,000. The same question about spread,
+    implied volatility, delta or time to expiry could not be asked, because
+    every one of those numbers was computed, used by a gate, and discarded.
+
+    Deliberately recorded at the ORDER, not the fill. A limit that never fills
+    still reflects a judgement that was made, and whether unfilled orders differ
+    from filled ones is itself a question worth being able to ask.
+
+    Never raises. This is measurement, and measurement must not be able to stop
+    a trade that the gates have already approved.
+    """
+    contract = draft.contract
+    try:
+        journal.record_entry_metrics(
+            occ_symbol=contract.occ_symbol,
+            underlying=brief.underlying,
+            direction=proposal.direction.value,
+            confidence=proposal.confidence,
+            quantity=draft.quantity,
+            limit_price=draft.limit_price,
+            cost=draft.total_cost,
+            spot=brief.spot,
+            strike=contract.strike,
+            days_to_expiry=contract.days_to_expiry(today),
+            delta=contract.abs_delta,
+            implied_vol=contract.implied_volatility,
+            realized_vol=draft.realized_vol,
+            iv_to_realized=premium_richness(contract.implied_volatility,
+                                            draft.realized_vol),
+            spread_pct=contract.spread_pct,
+            daily_decay=daily_decay_pct(contract, draft.spot, today),
+            open_interest=contract.open_interest,
+            atr_pct=atr_pct,
+            range_position=brief.range_position,
+            change_5d=brief.change_pct(5),
+            change_20d=brief.change_pct(20),
+            change_60d=brief.change_pct(60),
+            stop_spot=stop_spot,
+            target_spot=target_spot,
+        )
+    except Exception as exc:           # noqa: BLE001 -- see the docstring
+        logger.warning("could not record entry metrics for %s: %s",
+                       contract.occ_symbol, exc)
 
 
 def _announce_fills(positions: tuple[OpenPosition, ...] | list[OpenPosition],
@@ -518,9 +572,10 @@ async def run_pass(
         # Write down where the underlying stood, and the levels that will decide
         # this position's fate. Without this the stop has nothing to measure
         # against and silently falls back to the premium rule it replaced.
+        atr_pct = average_true_range_pct(brief.bars)
         stop_spot, target_spot = stop_and_target(
             brief.spot, proposal.direction.value,
-            atr_pct=average_true_range_pct(brief.bars),
+            atr_pct=atr_pct,
             settings=settings)
         journal.open_holding(
             occ_symbol=outcome.draft.contract.occ_symbol,
@@ -541,6 +596,9 @@ async def run_pass(
                   f"{brief.underlying} at {brief.spot:,.2f}. {proposal.rationale}")
         journal.record("ordered", brief.underlying, outcome.draft.contract.occ_symbol,
                        detail)
+        _record_entry_metrics(journal, outcome.draft, brief, proposal, settings,
+                              today=today, stop_spot=stop_spot,
+                              target_spot=target_spot, atr_pct=atr_pct)
         result.ordered += 1
 
         # The account has changed. Rebuilding the context rather than mutating
