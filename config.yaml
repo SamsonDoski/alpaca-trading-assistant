@@ -277,3 +277,39 @@ max_iv_to_realized: 1.15
 # loss can be noise, a premium gain of this size is not.
 # ---------------------------------------------------------------------------
 premium_target_backstop_pct: 0.50
+
+# ---------------------------------------------------------------------------
+# MINIMUM CONFIDENCE: 0.65, RAISED FROM 0.50
+#
+# The first thing on this project measured against outcomes rather than
+# reasoned about. 81 entries across both accounts, 1 Sep - 2 Oct 2026, each
+# paired with the round trip it produced:
+#
+#     stated confidence   trades   won    net
+#     0.55                    11    9%   -7,408
+#     0.60                    27   19%  -12,604
+#     0.65                    39   33%     -969
+#
+# Monotonic across three buckets, which is what makes it believable -- any
+# single cut on 81 trades would not be. The model's own conviction does carry
+# information; the gate was simply set below the level where it starts to mean
+# anything.
+#
+# At 0.50 every one of those low-conviction trades was allowed through, and
+# they account for almost the entire loss. Keeping only 0.65 and above would
+# have taken 40 of the 81 trades, won 32% instead of 23%, and finished at
+# -1,669 instead of -24,638.
+#
+# Two things this is NOT:
+#
+#   * It is not profitable. 32% still sits under the ~36% this payoff needs to
+#     break even. It stops most of the bleeding; it does not fix the entries.
+#   * It is not out-of-sample. The threshold was chosen after seeing these
+#     outcomes. The monotonicity is the evidence, not the -1,669.
+#
+# The model almost never exceeds 0.65 -- the highest seen in 4,356 opinions was
+# 0.70 -- so this keeps roughly half of all entries and will reduce trade count
+# noticeably. If the distribution shifts and entries stop entirely, that is the
+# first thing to check rather than a market that went quiet.
+# ---------------------------------------------------------------------------
+min_confidence: 0.65
