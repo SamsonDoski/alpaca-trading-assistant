@@ -345,6 +345,99 @@ async def cmd_trade(args) -> int:
     return 0
 
 
+async def cmd_evaluate(args) -> int:
+    """Mark every directional view the model gave, traded or not.
+
+    The journal holds thousands of opinions and barely a hundred trades, because
+    most views are refused for reasons that say nothing about whether the model
+    was right. This replays each one against the underlying's own bars and
+    reports how often it reached its target before its stop.
+
+    Reads only. Nothing here can place an order or change a position.
+    """
+    from collections import defaultdict
+
+    from agent.evaluation import build, resolve, summarise
+    from agent.journal import Journal
+
+    settings = load_settings(args.config)
+    journal = Journal()
+    views = journal.directional_views(since=args.since)
+    if not views:
+        print("  no directional views recorded yet")
+        return 0
+
+    symbols = sorted({v["underlying"] for v in views})
+    print(f"  {len(views)} views across {len(symbols)} symbols, "
+          f"replaying against daily bars")
+
+    results = []
+    async with open_reader() as reader:
+        for symbol in symbols:
+            try:
+                bars = await reader.recent_bars(symbol, days=args.days)
+            except MarketDataError as exc:
+                print(f"    {symbol}: no history ({exc})")
+                continue
+            if not bars:
+                continue
+
+            for view in (v for v in views if v["underlying"] == symbol):
+                history = [b for b in bars if b.day.isoformat() <= view["day"]]
+                forward = [b for b in bars if b.day.isoformat() > view["day"]]
+                trade = build(day=view["day"], underlying=symbol,
+                              direction=view["direction"],
+                              confidence=view["confidence"],
+                              traded=bool(view["traded"]),
+                              reason=view["reason"] or "",
+                              history=history, settings=settings)
+                if trade is not None:
+                    results.append(resolve(trade, forward, max_days=settings.dte_max))
+
+    if not results:
+        print("  nothing could be replayed -- not enough price history")
+        return 0
+
+    def report(label, rows):
+        if not rows:
+            print(f"    {label:<28} --")
+            return
+        s = summarise(rows)
+        if not s["decided"]:
+            print(f"    {label:<28} {s['views']:>4} views, none finished yet")
+            return
+        print(f"    {label:<28} {s['decided']:>4} finished   "
+              f"won {s['win_rate']:>4.0%}   "
+              f"(target {s['targets']}, stop {s['stops']}, ran out {s['expired']})")
+
+    print("\n  OVERALL")
+    report("every directional view", results)
+    report("views that became trades", [r for r in results if r.trade.traded])
+    report("views that were refused", [r for r in results if not r.trade.traded])
+
+    print("\n  BY STATED CONFIDENCE")
+    for lo, hi in ((0.0, 0.55), (0.55, 0.60), (0.60, 0.65), (0.65, 1.01)):
+        report(f"{lo:.2f} to {hi:.2f}",
+               [r for r in results if lo <= r.trade.confidence < hi])
+
+    print("\n  BY DIRECTION")
+    for side in ("up", "down"):
+        report(side, [r for r in results if r.trade.direction == side])
+
+    print("\n  REFUSED VIEWS, BY WHAT REFUSED THEM")
+    grouped = defaultdict(list)
+    for r in results:
+        if not r.trade.traded:
+            grouped[r.trade.reason[:40] or "(no reason)"].append(r)
+    for reason, rows in sorted(grouped.items(), key=lambda kv: -len(kv[1]))[:8]:
+        report(reason, rows)
+
+    print(f"\n  Shadow trades pay no spread, lose nothing to theta and are never")
+    print(f"  crushed by implied volatility. They measure DIRECTION. Dollars are")
+    print(f"  measured against the broker's fills, not here.")
+    return 0
+
+
 async def cmd_metrics(args) -> int:
     """Dump what every order was judged on, as CSV.
 
@@ -607,6 +700,13 @@ def main() -> int:
                        help="manage open positions and stop; no model call, "
                             "no new entries. Cheap enough to run between passes")
     trade.set_defaults(func=cmd_trade)
+
+    ev = sub.add_parser("evaluate",
+                        help="mark every view the model gave, traded or not")
+    ev.add_argument("--since", default=None, help="only views on or after this day")
+    ev.add_argument("--days", type=int, default=240,
+                    help="how much price history to pull per symbol")
+    ev.set_defaults(func=cmd_evaluate)
 
     metrics = sub.add_parser("metrics", help="what every order was judged on, as CSV")
     metrics.add_argument("--output", default=None, help="write to a file instead of stdout")

@@ -476,6 +476,35 @@ class Journal:
                             rationale=r["rationale"], thinking=r["thinking"])
                 for r in rows]
 
+    def directional_views(self, *, since: str | None = None) -> list[dict]:
+        """Every directional opinion the model expressed, one per symbol per day.
+
+        Most of these never became trades -- the book was full, three calls were
+        already open, the spread was too wide -- and that is exactly why they are
+        worth having. A refusal for a reason that has nothing to do with the
+        model is a free test of the model.
+
+        One row per symbol per day, taking the highest-conviction view of that
+        day, because the same symbol is examined every fifteen minutes and
+        twenty-six near-identical opinions would weight one day like a month.
+        `traded` says whether any of that day's passes actually approved it.
+        """
+        sql = (
+            "SELECT day, underlying, direction, MAX(confidence) AS confidence, "
+            "       MAX(approved) AS traded, "
+            "       MIN(reason) AS reason "
+            "FROM decisions "
+            "WHERE confidence IS NOT NULL AND direction IN ('up', 'down') "
+        )
+        args: tuple = ()
+        if since:
+            sql += "AND day >= ? "
+            args = (since,)
+        sql += "GROUP BY day, underlying, direction ORDER BY day, underlying"
+
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(sql, args)]
+
     def summary(self) -> dict:
         """Lifetime totals."""
         with self._connect() as conn:
