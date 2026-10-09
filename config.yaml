@@ -313,3 +313,43 @@ premium_target_backstop_pct: 0.50
 # first thing to check rather than a market that went quiet.
 # ---------------------------------------------------------------------------
 min_confidence: 0.65
+
+# ---------------------------------------------------------------------------
+# SIZE PER TRADE: 8% OF EQUITY, DOUBLED FROM 4%
+#
+# At 4% and roughly $86,000 of equity, a trade got about $3,400 -- which on a
+# $16 contract like GLD or NVDA buys two of them. Positions that small make the
+# account's outcome depend on rounding: one contract either way is a third of
+# the position.
+#
+# At 8% the same trade gets about $6,900, so an expensive contract is four or
+# five rather than two, and a cheap one is sized by the budget instead of by
+# how few contracts the budget happened to afford.
+#
+# WHAT THIS COSTS, STATED PLAINLY
+#
+# Size multiplies whatever the expectancy already is. It does not improve it.
+# Two measurements say that is a real cost here:
+#
+#   * The 2.4-year backtest recorded in settings.py went the other way when
+#     size rose from 2% to 4% -- profit factor fell from 1.11 to 1.02 and the
+#     worst drawdown rose from about $17k to about $44k.
+#   * Live expectancy across 90 closed trades on both accounts is about
+#     -0.35R per trade. Doubling size doubles the rate of that loss.
+#
+# The case for doing it anyway is that the system has changed underneath those
+# numbers -- the stop floor, the five-minute exits, the confidence gate and the
+# cooldown all post-date most of those trades -- and that an account deploying
+# a third of its cash cannot express a result either way. This is a deliberate
+# choice to find out faster, taken with the arithmetic above understood.
+#
+# Eight positions at 8% is 64% of equity deployed, so a third stays in cash and
+# the buying-power gate still shrinks anything that does not fit.
+# ---------------------------------------------------------------------------
+risk_per_trade: 0.08
+
+# Raised with the budget above. At 8% of equity a cheap contract -- F around
+# $1.07 -- would want roughly 64 of them, so the old cap of 50 would have
+# quietly trimmed the position and made the budget mean something different for
+# cheap options than for expensive ones.
+max_contracts: 150
