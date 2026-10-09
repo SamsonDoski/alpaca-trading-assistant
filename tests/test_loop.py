@@ -835,11 +835,41 @@ def test_a_collapsed_premium_still_closes_through_the_backstop():
     assert "collapsed, not the thesis" in decision.detail
 
 
-def test_a_backstop_close_starts_no_cooldown(journal):
-    """Nothing was disproved, so there is nothing to cool off from."""
+def test_a_backstop_close_also_starts_a_cooldown(journal):
+    """It used not to, on the argument that a collapsed option disproves no
+    thesis. On 9 Oct 2026 both accounts closed a GLD put at about -26% under
+    that label and bought a GLD call on the same name inside forty minutes."""
     journal.record("closed", "AAPL", "AAPL261016C00310000",
                    "premium backstop -- the option collapsed", pnl=-800)
-    assert journal.cooling_off(within_days=2) == {}
+    assert journal.cooling_off(within_days=2)["AAPL"] == 2
+
+
+def test_a_cooldown_blocks_the_opposite_side_too(journal):
+    """The rule keys on the underlying, not the direction. Taking the other
+    side of a name that just cost a full position is the case that forced this
+    change -- and it refutes its own premise: if the bearish view was still
+    alive, the bullish one cannot be."""
+    from agent.gates import Cooldown, GateContext
+    journal.record("closed", "GLD", "GLD261030P00392000",
+                   "premium backstop -- premium down -26.7% while GLD is only "
+                   "-0.8% from entry", pnl=-820)
+
+    ctx = GateContext(today=TODAY, market_open=True, trading_halted=False,
+                      account=AccountState(100_000, 100_000, 100_000),
+                      open_positions=(), cooling_off=journal.cooling_off(within_days=2),
+                      pending=frozenset(), settings=SETTINGS)
+
+    verdict = Cooldown().check("GLD", ctx)
+    assert verdict.decision.value == "deny"
+    assert "cooldown" in verdict.reason
+
+
+def test_a_small_expiry_loss_also_cools_off(journal):
+    """Keyed on money lost rather than on the words in the close, so a quiet
+    loser cannot slip back in the way the backstop label let GLD do."""
+    journal.record("closed", "AAPL", "AAPL261016C00310000",
+                   "expiry approaching -- 7 days left", pnl=-120)
+    assert journal.cooling_off(within_days=2)["AAPL"] == 2
 
 
 def test_a_position_we_did_not_open_falls_back_to_the_premium_stop():

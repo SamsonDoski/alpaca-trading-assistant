@@ -405,9 +405,25 @@ class Journal:
         last -- decision rows accumulate as the day goes on, and a cooldown that
         quietly expired at lunchtime would be worse than no cooldown at all.
 
-        Stop losses and externally-closed positions both count. A take-profit
+        **Any losing close counts, whatever reason it carries.** A take-profit
         does not: the reasoning worked, and re-entering after a win is not the
         behaviour this rule exists to prevent.
+
+        That used to be narrower. Only a stop loss started a cooldown, on the
+        argument that a premium backstop means the option collapsed while the
+        thesis survived -- nothing disproved, nothing to cool off from. On
+        9 Oct 2026 both accounts closed a GLD put at about -26% under that label
+        and bought a GLD CALL on the same name within forty minutes.
+
+        The argument had assumed the only re-entry worth preventing was the same
+        trade again. Taking the opposite side of a name that just cost a full
+        position is worse, and it refutes its own premise: if the bearish view
+        was still alive, the bullish one cannot be. The money is gone either
+        way, which is the fact the rule should key on.
+
+        The label still means what it meant -- a failed thesis reads differently
+        from a broken quote in the journal, and that is worth keeping. It just
+        no longer decides this.
         """
         today = as_of or datetime.now(UTC).date()
         # Bounded so this does not scan the whole history. Generous, because the
@@ -416,12 +432,15 @@ class Journal:
         floor = (today - timedelta(days=max(30, within_days * 10))).isoformat()
 
         with self._connect() as conn:
+            # A loss is a loss: `pnl < 0` covers stops, premium backstops and
+            # anything else that closed down. Positions closed outside the agent
+            # carry no P&L to judge, so those are matched by name.
             rows = conn.execute(
                 "SELECT underlying, MAX(day) AS day FROM events "
                 "WHERE action = 'closed' AND day >= ? "
-                "AND (detail LIKE ? OR detail LIKE ?) "
+                "AND (pnl < 0 OR detail LIKE ?) "
                 "GROUP BY underlying",
-                (floor, f"{_STOP_PREFIX}%", f"{_EXTERNAL_PREFIX}%"),
+                (floor, f"{_EXTERNAL_PREFIX}%"),
             ).fetchall()
 
             remaining: dict[str, int] = {}
@@ -520,10 +539,11 @@ class Journal:
                 "total_pnl": float(row["total_pnl"])}
 
 
-# The detail text of a stop-loss close begins with this, and `cooling_off`
-# matches on it. Named rather than repeated so the writer and the reader cannot
-# drift apart -- a cooldown that silently stops matching would be invisible.
-_STOP_PREFIX = "stop loss"
+# `cooling_off` no longer matches on the words in a close at all -- it keys on
+# money lost, so every losing close counts and no wording can exempt one.
+# `loop.py` still writes "stop loss" or "premium backstop", because a failed
+# thesis and a broken quote read differently in the journal and that is worth
+# keeping. It just no longer decides anything.
 
 # A position that left the book without the agent closing it. Kept separate from
 # the stop-loss prefix rather than borrowed, because the journal should not
