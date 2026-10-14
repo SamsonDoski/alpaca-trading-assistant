@@ -41,7 +41,7 @@ plainly rather than paper over:
 
 | Backend | Model | How the answer is validated |
 |---|---|---|
-| Anthropic | `claude-opus-5`, adaptive thinking, effort `high` | Structured output validated against a schema by the API, so a malformed answer is impossible by construction |
+| Anthropic | `claude-sonnet-5` by default, adaptive thinking, effort `medium`; model and effort both set by environment | Structured output validated against a schema by the API, so a malformed answer is impossible by construction |
 | OpenAI-compatible | Featherless, `deepseek-ai/DeepSeek-R1-0528` | JSON requested in the prompt and parsed defensively, because open models served this way do not all enforce a schema |
 
 **The competition paper account ran the Featherless backend**, on

@@ -181,15 +181,35 @@ def anthropic_answering(**overrides):
         **overrides))
 
 
-def test_anthropic_requests_opus_5_with_adaptive_thinking_shown():
+def test_anthropic_asks_with_adaptive_thinking_shown():
     client = anthropic_answering()
     AnthropicBackend(client).ask("system text", "user text")
     sent = client.messages.calls[0]
 
-    assert sent["model"] == "claude-opus-5"
+    assert sent["model"] == "claude-sonnet-5"
     assert sent["thinking"] == {"type": "adaptive", "display": "summarized"}
-    assert sent["output_config"]["effort"] == "high"
+    assert sent["output_config"]["effort"] == "medium"
     assert sent["output_format"] is ProposalSchema
+
+
+def test_the_claude_model_and_effort_come_from_the_environment(monkeypatch):
+    """So that trying a different model costs an env var rather than a redeploy.
+    The backend also names what it is using, which is printed on every pass."""
+    from agent.models import build_backend
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("MODEL_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+    monkeypatch.setenv("ANTHROPIC_EFFORT", "low")
+
+    backend = build_backend()
+    assert backend.name == "anthropic:claude-haiku-4-5-20251001"
+
+    backend._client = anthropic_answering()
+    backend.ask("system text", "user text")
+    sent = backend._client.messages.calls[0]
+    assert sent["model"] == "claude-haiku-4-5-20251001"
+    assert sent["output_config"]["effort"] == "low"
 
 
 def test_anthropic_caches_the_system_prompt():

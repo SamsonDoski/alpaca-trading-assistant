@@ -19,7 +19,7 @@ and writes down everything it considered — including what it refused and why.
 | One-page write-up | **[docs/WRITEUP.md](docs/WRITEUP.md)** — thesis, AI logic, every risk gate, the Alpaca integration, live results, and disclosure of pre-existing work |
 | Alpaca technologies used | Alpaca MCP Server (all market and account reads), Alpaca CLI (all order writes), Alpaca Trading API paper environment, Alpaca Market Data — option chains with Greeks and implied volatility, quotes, bars, corporate news, and the market clock |
 | Live result | +2.36% — equity $102,361, realized +$3,280 over three closed round trips |
-| Proposer backend | `ModelBackend` protocol, two implementations. Anthropic (`claude-opus-5`, schema-validated) and OpenAI-compatible (Featherless). **The account above ran Featherless on `deepseek-ai/DeepSeek-R1-0528`** after the Claude quota was exhausted mid-week |
+| Proposer backend | `ModelBackend` protocol, two implementations. Anthropic (schema-validated, `claude-sonnet-5` by default) and OpenAI-compatible (Featherless). Provider, model and effort are all environment variables, so switching needs no redeploy. The competition account ran Featherless on `deepseek-ai/DeepSeek-R1-0528` after the Claude quota was exhausted mid-week |
 | Tests | 312, no network and no API key required — `pytest -q` |
 
 ---

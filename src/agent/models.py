@@ -33,8 +33,19 @@ from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_MODEL = "claude-opus-5"
-ANTHROPIC_EFFORT = "high"
+# Sonnet rather than Opus, and the reason is measured rather than budgetary.
+#
+# Across 301 evaluated directional views the model reached its target 17% of the
+# time against a coin flip at 19%, and the strongest single predictor found so
+# far was its own stated confidence -- not the depth of its reasoning. A task
+# where the best available model performs around chance does not justify the
+# most expensive one, and the per-pass cost is multiplied by fifteen symbols
+# plus a ranking call.
+#
+# Both are overridable by environment, so trying Opus again -- or Haiku, which
+# is cheaper still -- needs no code change and no redeploy.
+ANTHROPIC_MODEL = "claude-sonnet-5"
+ANTHROPIC_EFFORT = "medium"
 
 FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
 FEATHERLESS_MODEL = "Qwen/Qwen2.5-72B-Instruct"
@@ -372,13 +383,23 @@ def build_backend(provider: str | None = None) -> ModelBackend:
     Chosen by environment rather than by config file so that switching provider
     needs no code change, no redeploy, and no edit to a file under version
     control -- it takes effect on the next scheduled pass.
+
+    Which Claude, and how hard it thinks, are read the same way:
+
+        ANTHROPIC_MODEL=claude-haiku-4-5-20251001
+        ANTHROPIC_EFFORT=low
+
+    The defaults above are deliberate rather than merely cheap; see the note on
+    ANTHROPIC_MODEL.
     """
     provider = (provider or os.getenv("MODEL_PROVIDER") or "anthropic").strip().lower()
 
     if provider == "anthropic":
         if not os.getenv("ANTHROPIC_API_KEY"):
             raise ModelUnavailable("MODEL_PROVIDER=anthropic but ANTHROPIC_API_KEY is not set")
-        return AnthropicBackend()
+        return AnthropicBackend(
+            model=os.getenv("ANTHROPIC_MODEL", ANTHROPIC_MODEL),
+            effort=os.getenv("ANTHROPIC_EFFORT", ANTHROPIC_EFFORT))
 
     if provider in ("featherless", "openai-compatible"):
         api_key = os.getenv("FEATHERLESS_API_KEY") or os.getenv("OPENAI_API_KEY")
