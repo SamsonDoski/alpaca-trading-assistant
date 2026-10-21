@@ -312,7 +312,42 @@ premium_target_backstop_pct: 0.50
 # noticeably. If the distribution shifts and entries stop entirely, that is the
 # first thing to check rather than a market that went quiet.
 # ---------------------------------------------------------------------------
-min_confidence: 0.65
+min_confidence: 0.60
+
+# ---------------------------------------------------------------------------
+# RECALIBRATED TO 0.60 FOR SONNET, 21 OCT 2026
+#
+# A confidence threshold belongs to the model that produced the numbers. 0.65
+# was derived from DeepSeek-R1, whose opinions spanned 0.50 to 0.70 and clustered
+# on 0.65 -- there, it was the top band. Carrying it across to Sonnet silently
+# stopped the agent: of 1,723 opinions between 15 and 21 Oct, exactly THREE
+# reached 0.65. The last entry on either account was 13 Oct, and both books ran
+# down to cash while nothing new could pass.
+#
+# Sonnet's distribution, same window:
+#
+#     min 0.00   median 0.58   max 0.68
+#
+#     >= 0.55    75% of all opinions pass
+#     >= 0.58    53%
+#     >= 0.60    31%        <- here
+#     >= 0.62    15%
+#     >= 0.65     0.2%
+#
+# Roughly a quarter of opinions sit below 0.50; those are the model declining
+# outright, so among views that actually name a direction 0.60 keeps about 41%.
+# Under DeepSeek, 0.65 kept 40 of 81 entries -- about half. 0.60 is the nearest
+# match on selectivity, and sits above the median, so it is genuinely choosing
+# rather than waving things through.
+#
+# The wider spread is the prompt rewrite working: it asked for the range to be
+# used, and DeepSeek never once went below 0.50 while Sonnet reaches 0.00.
+#
+# What this number is NOT is validated. The 0.65 figure had outcome data behind
+# it -- win rates by bucket across 81 closed trades. This one has none, because
+# Sonnet has not completed a single trade. It is a calibration to a distribution,
+# not to results. Re-derive it from outcomes once ~20 trades have closed.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # SIZE PER TRADE: 8% OF EQUITY, DOUBLED FROM 4%
