@@ -226,6 +226,42 @@ def _record_entry_metrics(journal: Journal, draft, brief: MarketBrief, proposal,
                        contract.occ_symbol, exc)
 
 
+def _book_completed_sales(positions: tuple[OpenPosition, ...] | list[OpenPosition],
+                          journal: Journal) -> int:
+    """Book every sale the broker now agrees actually happened.
+
+    `_close` sends the order and records it as `sold`. This is where the trade
+    becomes `closed`: once, when the position is genuinely gone, however many
+    orders it took to get there.
+
+    The separation exists because conflating the two double-counted a trade. On
+    22 Oct a GLD put hit its premium target at 19:40 and went out as a patient
+    limit; the 19:45 pass found it still held with that order resting, escalated
+    to market, and wrote a second `closed` row. One +$3,020 trade was reported
+    as +$6,040 of realised P&L.
+
+    Booking from the sale rather than the holdings row matters for positions the
+    agent sold but never opened -- an older system's, or one whose holdings row
+    was already cleared. Those have no row to reconcile, so keying off the row
+    alone would leave the trade unbooked for ever.
+
+    Returns how many trades were booked.
+    """
+    held = {p.occ_symbol for p in positions}
+    booked = 0
+
+    for sale in journal.unbooked_sales():
+        if sale["symbol"] in held:
+            continue                      # the order has not filled yet
+        journal.record("closed", sale["underlying"], sale["symbol"],
+                       sale["detail"], pnl=sale["pnl"])
+        journal.close_holding(sale["symbol"])
+        logger.info("%s confirmed closed by the broker", sale["symbol"])
+        booked += 1
+
+    return booked
+
+
 def _announce_fills(positions: tuple[OpenPosition, ...] | list[OpenPosition],
                     journal: Journal, notifier: Notifier) -> int:
     """Record and announce each ordered position the broker now shows as held.
@@ -335,6 +371,11 @@ async def run_pass(
     # Before any exit is evaluated, because `check_exit` reads the holdings
     # table and a stale row there is worse than a missing one: it supplies stop
     # and target levels computed for a trade that is already over.
+    # Sales that have filled since the pass that sent them. Booked before
+    # reconciliation, so a position the agent sold is recognised as its own
+    # trade rather than mistaken for one someone closed by hand.
+    result.closed += _book_completed_sales(positions, journal)
+
     _reconcile_holdings(positions, journal, notifier, executor)
 
     # Orders from earlier passes that have filled since. Announced here rather
@@ -723,10 +764,21 @@ async def _close(decision: ExitDecision, reader, executor: CliExecutor,
     detail = (f"{_detail_prefix(decision)} — {decision.detail}, {how}. "
               f"P&L ${pnl:+,.0f} ({position.return_pct:+.1%}) [{receipt.client_order_id}]")
 
-    journal.record("closed", position.underlying, position.occ_symbol, detail, pnl=pnl)
-    # The holdings table tracks live positions only. Leaving a stale row would
-    # let a later re-entry inherit levels computed for a different trade.
-    journal.close_holding(position.occ_symbol)
+    # Recorded as SOLD, not closed, for the same reason an entry is recorded as
+    # ordered rather than opened: sending a sell order and no longer holding the
+    # position are different events, and on this feed a patient limit routinely
+    # sits unfilled between them.
+    #
+    # Conflating them double-counted a trade. On 22 Oct a GLD put hit its
+    # premium target at 19:40 and went out as a limit; the 19:45 pass found it
+    # still held with the order resting, escalated to market, and wrote a second
+    # `closed` row. The day's realised P&L read +$6,040 for one +$3,020 trade.
+    #
+    # The holdings row stays too. Deleting it here cost the escalating pass its
+    # stop and target levels, which is why the second notification called a
+    # premium target a take profit -- harmless on a winner, but the same path
+    # handles stops.
+    journal.record("sold", position.underlying, position.occ_symbol, detail, pnl=pnl)
     notifier.closed(position.occ_symbol, detail, won=pnl > 0)
 
 

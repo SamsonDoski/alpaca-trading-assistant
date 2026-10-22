@@ -1285,3 +1285,89 @@ def test_a_broken_recorder_cannot_stop_a_trade(journal, monkeypatch):
     assert result.ordered == 1
     assert ("buy", "AAPL261016C00310000") in executor.actions
     assert result.errors == []
+
+
+# --- A sell order is not a closed trade -------------------------------------
+
+def test_sending_a_sell_records_it_as_sold_not_closed(journal):
+    """Realised P&L must not move until the broker agrees the position is gone."""
+    stopped = position("AAPL", entry=20.00, current=15.00)
+    run(FakeReader(positions=(stopped,)), FakeExecutor(), FakeProposer({}),
+        journal, RecordingNotifier())
+
+    assert [e.action for e in journal.recent(limit=20)].count("sold") == 1
+    assert _events(journal, "closed") == []
+    assert journal.realized_for_day() == 0
+
+
+def test_one_trade_books_once_however_many_orders_it_took(journal):
+    """The regression. On 22 Oct a GLD put hit its premium target and went out
+    as a patient limit; the next pass found it still held, escalated to market,
+    and wrote a second closed row. One +$3,020 trade read as +$6,040."""
+    winner = position("AAPL", entry=10.00, current=15.00)      # +50%, take profit
+
+    # First pass: the limit goes out. Second: it has not filled, so the stale
+    # order is cancelled and replaced. Two sell orders, one position.
+    run(FakeReader(positions=(winner,)), FakeExecutor(), FakeProposer({}),
+        journal, RecordingNotifier())
+    run(FakeReader(positions=(winner,)),
+        FakeExecutor(resting_exits=[winner.occ_symbol]), FakeProposer({}),
+        journal, RecordingNotifier())
+
+    assert len(_events(journal, "sold")) == 2
+    assert _events(journal, "closed") == []
+    assert journal.realized_for_day() == 0
+
+    # Third pass: the broker no longer reports it. Booked exactly once.
+    journal.open_holding(occ_symbol=winner.occ_symbol, underlying="AAPL",
+                         direction="up", entry_spot=313.0, entry_premium=10.0,
+                         stop_spot=300.0, target_spot=340.0)
+    result = run(FakeReader(positions=()), FakeExecutor(), FakeProposer({}),
+                 journal, RecordingNotifier())
+
+    closed = _events(journal, "closed")
+    assert len(closed) == 1
+    assert result.closed == 1
+    assert journal.realized_for_day() == pytest.approx(winner.unrealized_pnl)
+
+
+def test_a_sale_books_even_with_no_holdings_row(journal):
+    """Positions the agent sold but never opened have no row to reconcile.
+    Keying off the row alone would leave the trade unbooked for ever."""
+    from agent.loop import _book_completed_sales
+    journal.record("sold", "AAPL", "AAPL261016C00310000", "take profit", pnl=800)
+
+    assert _book_completed_sales([], journal) == 1
+    assert journal.realized_for_day() == 800
+
+
+def test_a_sale_is_not_booked_while_the_position_is_still_held(journal):
+    from agent.loop import _book_completed_sales
+    held = position("AAPL")
+    journal.record("sold", "AAPL", held.occ_symbol, "take profit", pnl=800)
+
+    assert _book_completed_sales([held], journal) == 0
+    assert journal.realized_for_day() == 0
+
+
+def test_a_booked_loss_still_starts_a_cooldown(journal):
+    """Cooldown keys on the closed row, so it has to survive the move."""
+    from agent.loop import _book_completed_sales
+    journal.record("sold", "AAPL", "AAPL261016C00310000", "stop loss", pnl=-900)
+
+    _book_completed_sales([], journal)
+    assert journal.cooling_off(within_days=2)["AAPL"] == 2
+
+
+def test_an_externally_closed_position_is_not_mistaken_for_our_own_sale(journal):
+    """No sale went out, so this is someone else closing it -- which alerts and
+    cools off, where booking our own sale does neither."""
+    from agent.loop import _reconcile_holdings
+    _hold(journal, "F261016P00015000", "F")
+    notifier = RecordingNotifier()
+
+    _reconcile_holdings([], journal, notifier,
+                        ReconcileExecutor(filled=["F261016P00015000"]))
+
+    assert "alert" in notifier.calls
+    assert journal.cooling_off(within_days=2)["F"] == 2

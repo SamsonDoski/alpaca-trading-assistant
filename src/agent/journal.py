@@ -35,8 +35,11 @@ CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     at          TEXT NOT NULL,
     day         TEXT NOT NULL,
-    action      TEXT NOT NULL,   -- ordered | opened | unfilled | closed | alert
-                                 -- ordered = sent to the broker; opened = filled
+    action      TEXT NOT NULL,   -- ordered | opened | unfilled | sold | closed | alert
+                                 -- ordered/sold = sent to the broker
+                                 -- opened/closed = the broker confirmed it
+                                 -- Only `closed` carries realised P&L, because
+                                 -- only it happens exactly once per trade.
     underlying  TEXT NOT NULL,
     symbol      TEXT NOT NULL,   -- the OCC contract symbol
     detail      TEXT NOT NULL,
@@ -317,6 +320,28 @@ class Journal:
                 "SELECT occ_symbol, underlying, opened_at, direction, entry_spot, "
                 "entry_premium, stop_spot, target_spot FROM holdings").fetchall()
         return [Holding(**dict(row)) for row in rows]
+
+    def unbooked_sales(self) -> list[dict]:
+        """Sell orders that have gone out but whose trade is not booked yet.
+
+        A contract can be sold more than once before it leaves the book -- a
+        patient limit that does not fill is cancelled and replaced the next
+        pass. Only the LATEST sale is returned for each contract, and only while
+        no `closed` row has been written since it, so one trade books once no
+        matter how many orders it took.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT s.symbol, s.underlying, s.detail, s.pnl "
+                "FROM events s "
+                "WHERE s.action = 'sold' "
+                "  AND s.id = (SELECT MAX(id) FROM events "
+                "              WHERE action = 'sold' AND symbol = s.symbol) "
+                "  AND NOT EXISTS (SELECT 1 FROM events c "
+                "                  WHERE c.action = 'closed' "
+                "                    AND c.symbol = s.symbol AND c.id > s.id)"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def unannounced_fills(self, held: set[str]) -> list[Holding]:
         """Positions we hold whose fill has not been recorded yet.
