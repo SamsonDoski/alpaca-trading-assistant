@@ -400,9 +400,17 @@ async def run_pass(
         # premium rule rather than skipping the check -- an unmanaged position is
         # worse than a bluntly managed one.
         spot = await reader.stock_price(position.underlying)
+
+        # The high-water mark moves up here and nowhere else. It has to happen
+        # on every pass, before the check and whether or not anything closes,
+        # because a peak that is not written while the position is at it is
+        # gone -- the next pass reads a price, not a history.
+        holding = journal.holding(position.occ_symbol)
+        if holding is not None:
+            holding = journal.raise_peak(holding, position.current_price)
+
         decision = check_exit(position, settings, today,
-                              holding=journal.holding(position.occ_symbol),
-                              spot=spot)
+                              holding=holding, spot=spot)
         if decision is None:
             continue
         try:

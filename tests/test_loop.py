@@ -781,6 +781,156 @@ def test_a_large_gain_is_banked_even_before_the_underlying_target():
     assert "still short of the" in decision.detail
 
 
+# --- The trailing stop -----------------------------------------------------
+#
+# All of these build the Holding directly, because what the rule reads is
+# `peak_premium` and the point of each test is what that number does.
+
+def _trailed(occ="AAPL261016C00310000", underlying="AAPL", *, direction="up",
+             entry_spot=313.0, entry_premium=10.00, peak,
+             stop_spot=280.0, target_spot=360.0):
+    from agent.journal import Holding
+    return Holding(occ, underlying, "2026-09-04T00:00:00", direction,
+                   entry_spot, entry_premium, stop_spot=stop_spot,
+                   target_spot=target_spot, peak_premium=peak)
+
+
+def test_a_position_that_was_never_ahead_is_not_trailed():
+    """The arm is what separates a trailing stop from a tighter hard stop.
+
+    Always-on, the high-water mark starts at the entry fill, so this position --
+    down 20%, never up at all -- would be sold. Replayed over the book that rule
+    cut six winners, TLT 78C among them, which went on to +85%.
+    """
+    held = position(entry=10.00, current=8.00)               # -20%, peak = entry
+    assert check_exit(held, SETTINGS, TODAY,
+                      holding=_trailed(peak=10.00), spot=313.0) is None
+
+
+def test_giving_back_a_fifth_of_the_peak_closes_the_position():
+    from agent.exits import ExitReason
+    held = position(entry=10.00, current=11.20)              # 20% under a 14.00 peak
+    decision = check_exit(held, SETTINGS, TODAY,
+                          holding=_trailed(peak=14.00), spot=313.0)
+    assert decision is not None
+    assert decision.reason is ExitReason.TRAILING_STOP
+    assert "from a peak of 14.00" in decision.detail
+
+
+def test_the_trailing_stop_fires_while_still_in_profit():
+    """Which is the whole point: it closes trades that are winning and fading,
+    long before the -25% floor could reach them."""
+    held = position(entry=10.00, current=11.20)              # still +12%
+    decision = check_exit(held, SETTINGS, TODAY,
+                          holding=_trailed(peak=14.00), spot=313.0)
+    assert decision is not None and held.return_pct > 0
+
+
+def test_a_shallow_pullback_is_left_alone():
+    """Winners pull back. The median winner in the book gave back 12% of its
+    best price at some point and still reached the target, so 14% has to be a
+    non-event or the rule eats the thing it is meant to protect."""
+    held = position(entry=10.00, current=12.00)              # -14% from a 14.00 peak
+    assert check_exit(held, SETTINGS, TODAY,
+                      holding=_trailed(peak=14.00), spot=313.0) is None
+
+
+def test_the_arm_is_judged_on_the_peak_not_the_current_mark():
+    """Once a position has been ahead the rule stays live all the way down.
+    Testing the arm against the mark would disarm it exactly when the giveback
+    starts, which is the only moment it matters."""
+    from agent.exits import ExitReason
+    held = position(entry=10.00, current=9.50)               # -5% now, +30% once
+    decision = check_exit(held, SETTINGS, TODAY,
+                          holding=_trailed(peak=13.00), spot=313.0)
+    assert decision is not None and decision.reason is ExitReason.TRAILING_STOP
+
+
+def test_a_quote_below_intrinsic_does_not_fire_the_trailing_stop():
+    """The PFE 29 put of 16 Sep 2026, marked at 0.72 with PFE at 27.40 against
+    an intrinsic value of 1.60. On the mark alone the position looks 62% off its
+    peak; on a price that can actually exist it is 16% off and still ahead."""
+    held = OpenPosition("PFE261016P00029000", "PFE", 10, 1.00, 0.72, EXPIRY,
+                        right="put")
+    holding = _trailed("PFE261016P00029000", "PFE", direction="down",
+                       entry_spot=28.00, entry_premium=1.00, peak=1.90,
+                       stop_spot=30.00, target_spot=24.00)
+    assert check_exit(held, SETTINGS, TODAY, holding=holding, spot=27.40) is None
+
+
+def test_the_premium_floor_still_outranks_the_trailing_stop():
+    """Both would fire. The floor is the one the sizing arithmetic depends on,
+    so it is the one that gets reported -- and it is the one that carries a
+    cooldown."""
+    from agent.exits import ExitReason
+    held = position(entry=10.00, current=7.40)               # -26%, and off a peak
+    decision = check_exit(held, SETTINGS, TODAY, holding=_trailed(peak=14.00))
+    assert decision is not None and decision.reason is ExitReason.STOP_LOSS
+
+
+def test_a_trailing_stop_is_urgent():
+    """It fires because the price is falling, so a patient limit spends exactly
+    the gain it was placed to protect."""
+    decision = check_exit(position(entry=10.00, current=11.20), SETTINGS, TODAY,
+                          holding=_trailed(peak=14.00), spot=313.0)
+    assert decision is not None and decision.urgent
+
+
+def test_a_trailing_stop_is_not_labelled_a_stop_loss():
+    """`cooling_off` keys on realised P&L, but the label is what a human reads
+    in the journal, and most of these closes are wins."""
+    from agent.loop import _detail_prefix
+    decision = check_exit(position(entry=10.00, current=11.20), SETTINGS, TODAY,
+                          holding=_trailed(peak=14.00), spot=313.0)
+    assert _detail_prefix(decision) == "trailing stop"
+
+
+def test_the_peak_is_raised_and_never_lowered(journal):
+    journal.open_holding(occ_symbol="AAPL261016C00310000", underlying="AAPL",
+                         direction="up", entry_spot=313.0, entry_premium=10.00,
+                         stop_spot=280.0, target_spot=360.0)
+    holding = journal.holding("AAPL261016C00310000")
+    assert holding.peak_premium == 10.00          # seeded at the entry premium
+
+    holding = journal.raise_peak(holding, 14.00)
+    assert holding.peak_premium == 14.00
+    assert journal.holding("AAPL261016C00310000").peak_premium == 14.00
+
+    holding = journal.raise_peak(holding, 11.20)  # a fall leaves it alone
+    assert holding.peak_premium == 14.00
+    assert journal.holding("AAPL261016C00310000").peak_premium == 14.00
+
+
+def test_a_journal_written_before_the_peak_column_existed_still_opens(tmp_path):
+    """`CREATE TABLE IF NOT EXISTS` is a no-op against a live database, so the
+    column has to be added separately or both deployed accounts break on the
+    first query that names it."""
+    path = tmp_path / "old.db"
+    Journal(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE holdings")
+        conn.execute("CREATE TABLE holdings ("
+                     "occ_symbol TEXT PRIMARY KEY, underlying TEXT NOT NULL, "
+                     "opened_at TEXT NOT NULL, direction TEXT NOT NULL, "
+                     "entry_spot REAL NOT NULL, entry_premium REAL NOT NULL, "
+                     "stop_spot REAL NOT NULL, target_spot REAL NOT NULL)")
+
+    journal = Journal(path)
+    journal.open_holding(occ_symbol="AAPL261016C00310000", underlying="AAPL",
+                         direction="up", entry_spot=313.0, entry_premium=10.00,
+                         stop_spot=280.0, target_spot=360.0)
+    assert journal.holding("AAPL261016C00310000").peak_premium == 10.00
+
+
+def test_a_holding_from_before_the_trailing_stop_is_not_trailed():
+    """Those rows carry a zero peak until a pass raises it. Zero would make the
+    trail line zero and the arm unmeetable, but it is worth being explicit: the
+    position is simply left to the other rules until it has been marked once."""
+    held = position(entry=10.00, current=5.00)
+    assert check_exit(held, SETTINGS, TODAY,
+                      holding=_trailed(peak=0.0), spot=313.0).reason is not None
+
+
 def test_a_gain_below_the_backstop_keeps_running():
     """The underlying target still governs anything short of the threshold."""
     from agent.exits import check_exit

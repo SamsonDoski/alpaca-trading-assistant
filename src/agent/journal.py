@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -65,7 +65,12 @@ CREATE TABLE IF NOT EXISTS holdings (
     entry_spot   REAL NOT NULL,   -- the underlying's price when we bought
     entry_premium REAL NOT NULL,
     stop_spot    REAL NOT NULL,   -- underlying level that invalidates the thesis
-    target_spot  REAL NOT NULL
+    target_spot  REAL NOT NULL,
+    -- Highest mark this position has reached, which the trailing stop measures
+    -- down from. Kept here rather than recomputed because there is nowhere to
+    -- recompute it FROM: the agent sees a price every five minutes and keeps
+    -- none of them, so a peak that is not written down when it happens is gone.
+    peak_premium REAL NOT NULL DEFAULT 0
 );
 
 -- The numbers behind an order, written when it is sent.
@@ -131,6 +136,22 @@ CREATE INDEX IF NOT EXISTS idx_decisions_day ON decisions(day DESC);
 """
 
 
+# Columns added to tables that already exist in the wild. `CREATE TABLE IF NOT
+# EXISTS` is a no-op against a live database, so a new column has to be added
+# separately or the two deployed accounts would keep running on the old shape
+# and fail on the first query that names it.
+_ADDED_COLUMNS = (
+    ("holdings", "peak_premium", "REAL NOT NULL DEFAULT 0"),
+)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    for table, column, spec in _ADDED_COLUMNS:
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {spec}")
+
+
 @dataclass(frozen=True, slots=True)
 class Event:
     at: str
@@ -155,6 +176,13 @@ class Holding:
     entry_premium: float
     stop_spot: float
     target_spot: float
+    # Highest mark seen since the position was opened. Zero on a row written
+    # before this column existed; the first exits pass raises it to the mark.
+    peak_premium: float = 0.0
+
+    def trail_stop_price(self, drop_pct: float) -> float:
+        """The price the trailing stop would sell at, given the peak so far."""
+        return self.peak_premium * (1 - drop_pct)
 
     def breached_stop(self, spot: float) -> bool:
         """Whether the underlying has moved through the level that invalidates
@@ -198,6 +226,7 @@ class Journal:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            _add_missing_columns(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.path), timeout=30.0)
@@ -283,11 +312,33 @@ class Journal:
         with self._connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO holdings (occ_symbol, underlying, opened_at, "
-                "direction, entry_spot, entry_premium, stop_spot, target_spot) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "direction, entry_spot, entry_premium, stop_spot, target_spot, "
+                "peak_premium) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (occ_symbol, underlying, datetime.now(UTC).isoformat(), direction,
-                 entry_spot, entry_premium, stop_spot, target_spot),
+                 entry_spot, entry_premium, stop_spot, target_spot, entry_premium),
             )
+
+    def raise_peak(self, holding: Holding, mark: float) -> Holding:
+        """Move the high-water mark up to `mark`, and hand back the row as it
+        now stands.
+
+        The comparison is in SQL as well as in Python. Two passes can overlap --
+        the five-minute exits pass and the fifteen-minute full pass share these
+        rows -- and `UPDATE ... WHERE ? > peak_premium` cannot lower a peak that
+        the other one raised in between, where a read-then-write could.
+
+        A mark at or below the peak is left alone rather than written, so a
+        position that never makes a new high costs no writes at all.
+        """
+        if mark <= 0 or mark <= holding.peak_premium:
+            return holding
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE holdings SET peak_premium = ? "
+                "WHERE occ_symbol = ? AND ? > peak_premium",
+                (mark, holding.occ_symbol, mark),
+            )
+        return replace(holding, peak_premium=mark)
 
     def close_holding(self, occ_symbol: str) -> None:
         with self._connect() as conn:
@@ -304,7 +355,8 @@ class Journal:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT occ_symbol, underlying, opened_at, direction, entry_spot, "
-                "entry_premium, stop_spot, target_spot FROM holdings "
+                "entry_premium, stop_spot, target_spot, peak_premium "
+                "FROM holdings "
                 "WHERE occ_symbol = ?", (occ_symbol,)).fetchone()
         return Holding(**dict(row)) if row else None
 
@@ -318,7 +370,8 @@ class Journal:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT occ_symbol, underlying, opened_at, direction, entry_spot, "
-                "entry_premium, stop_spot, target_spot FROM holdings").fetchall()
+                "entry_premium, stop_spot, target_spot, peak_premium "
+                "FROM holdings").fetchall()
         return [Holding(**dict(row)) for row in rows]
 
     def unbooked_sales(self) -> list[dict]:
