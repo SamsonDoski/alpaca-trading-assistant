@@ -6,15 +6,22 @@ of screening, reasoning and gating exists to make "nothing" the easy answer.
 Exits are not optional. A position that has hit its stop must close, and no rule
 in this system is allowed to prevent that.
 
-So there is no model call here, no gate chain, and no discretion. Three plain
-comparisons against numbers fixed when the position was opened, evaluated fresh
-on every pass.
+So there is no model call here, no gate chain, and no discretion. A handful of
+plain comparisons, evaluated fresh on every pass.
 
-**Why this runs every fifteen minutes rather than twice a day.** Alpaca supports
+All but one are against numbers fixed when the position was opened. The
+exception is the trailing stop, which measures down from the highest mark the
+position has reached -- a number that only exists because each pass writes it to
+the holdings row. There is nothing to recompute it from afterwards: the agent
+sees a price every five minutes and keeps none of them.
+
+**Why this runs every five minutes rather than twice a day.** Alpaca supports
 trailing stops for stocks, not for options. There is no protective order resting
 at the broker, so a stop only exists while this code is running. The gap between
 passes is the distance a position can travel unwatched, which makes the schedule
-interval a risk parameter rather than an operational convenience.
+interval a risk parameter rather than an operational convenience -- and doubly
+so for the trailing stop, whose peak is only as good as the marks that were
+sampled on the way up.
 """
 
 from __future__ import annotations
@@ -41,6 +48,10 @@ class ExitReason(str, Enum):
     # worth banking even though the underlying has not reached the level the
     # thesis was aiming at.
     PREMIUM_TARGET = "premium target"
+    # The position was meaningfully ahead and has given a fifth of its best
+    # price back. Distinct from STOP_LOSS because it is usually not a loss at
+    # all -- it fires above the entry as often as below it.
+    TRAILING_STOP = "trailing stop"
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,8 +76,13 @@ class ExitDecision:
         A take profit is the opposite situation. The position is moving in our
         favour, so waiting for a better fill costs nothing worse than a smaller
         gain, and there is no runaway to outrun.
+
+        A trailing stop is on the first side of that line even when it fires in
+        profit. What triggers it is a fall, and the gain it is protecting is
+        exactly what a patient limit would spend while the fall continues.
         """
-        return self.reason in (ExitReason.STOP_LOSS, ExitReason.PREMIUM_BACKSTOP)
+        return self.reason in (ExitReason.STOP_LOSS, ExitReason.PREMIUM_BACKSTOP,
+                               ExitReason.TRAILING_STOP)
 
 
 def check_exit(position: OpenPosition, settings: Settings, today: date,
@@ -74,12 +90,19 @@ def check_exit(position: OpenPosition, settings: Settings, today: date,
                spot: float | None = None) -> ExitDecision | None:
     """Whether this position should be closed now.
 
-    Two stops run together, and the position closes on whichever comes first.
+    Three stops run together, and the position closes on whichever comes first.
 
     **The premium stop is an absolute floor.** It answers "has this trade lost
     what we budgeted for it to lose?", and the sizing arithmetic depends on the
     answer being no more than `stop_loss_pct`. It is checked first and applies to
     every position without exception.
+
+    **The trailing stop protects an open gain.** Once the position has been
+    `trailing_arm_pct` ahead, it closes on a `trailing_stop_pct` fall from its
+    best mark. Nothing else in this function can do that: the floor only knows
+    about the entry price, so a position that ran to +45% and came all the way
+    back was invisible until it was 25% underwater. Eleven trades did exactly
+    that, for a measured $10,521.
 
     **The underlying stop asks a different question:** has the stock moved
     through the level that says the thesis was wrong? That one is keyed to the
@@ -115,9 +138,10 @@ def check_exit(position: OpenPosition, settings: Settings, today: date,
     # currently offering, and then selling into that same thin book.
     intrinsic = position.intrinsic(spot)
     if intrinsic is not None and intrinsic > position.current_price:
-        ret_for_stops = position.return_pct_at(intrinsic)
+        mark_for_stops = intrinsic
     else:
-        ret_for_stops = ret
+        mark_for_stops = position.current_price
+    ret_for_stops = position.return_pct_at(mark_for_stops)
 
     # --- the floor, checked before anything else --------------------------
     #
@@ -152,6 +176,30 @@ def check_exit(position: OpenPosition, settings: Settings, today: date,
             f"premium down {ret:.1%} past the {settings.stop_loss_pct:.0%} stop, "
             f"with {position.underlying} {move:+.1%} from entry "
             f"(underlying stop {holding.stop_spot:,.2f})")
+
+    # --- the trailing stop ------------------------------------------------
+    #
+    # Checked before the thesis rules below because it is the tighter of the
+    # two, and because what it reports is what actually happened: the position
+    # gave back a fifth of its best price. Judged on the same `mark_for_stops`
+    # as the floor, so a quote printed below intrinsic cannot flush a position
+    # that is really still ahead.
+    #
+    # The arm is tested against the PEAK, not the mark. Once a position has been
+    # ahead the rule stays live all the way down -- that is the whole point, and
+    # testing it against the current mark would disarm it exactly when the
+    # giveback starts.
+    if holding is not None and holding.peak_premium > 0:
+        peak_return = position.return_pct_at(holding.peak_premium)
+        trail_at = holding.trail_stop_price(settings.trailing_stop_pct)
+        if peak_return >= settings.trailing_arm_pct and mark_for_stops <= trail_at:
+            return ExitDecision(
+                position, ExitReason.TRAILING_STOP,
+                f"premium {ret:+.1%}, down "
+                f"{(holding.peak_premium - mark_for_stops) / holding.peak_premium:.1%} "
+                f"from a peak of {holding.peak_premium:,.2f} ({peak_return:+.1%}), "
+                f"past the {settings.trailing_stop_pct:.0%} trailing stop "
+                f"at {trail_at:,.2f}")
 
     # No entry level recorded: this is not ours, or predates the holdings table.
     if holding is None or spot is None or spot <= 0:

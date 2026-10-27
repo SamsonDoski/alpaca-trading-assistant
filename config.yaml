@@ -279,6 +279,37 @@ max_iv_to_realized: 1.15
 premium_target_backstop_pct: 0.50
 
 # ---------------------------------------------------------------------------
+# TRAILING STOP: 20% FROM THE PEAK, ARMED AT +10%
+#
+# The book's losses are not mostly round trips -- 51 of 66 losing trades never
+# got 25% ahead at all, and no trailing rule can reach those. This is aimed at
+# the rest: WMT once +43%, NVDA +45%, NVDA +44%, SLV +51%, every one of them
+# eventually sold at the -25% stop.
+#
+# Replayed on five-minute marks over all 89 round trips that carry them, with
+# each trade's bars clipped to the window between the buy fill and the sell so
+# nothing after the real exit can trigger anything:
+#
+#     rule                  ALL    early     late     beta    first   W cut
+#     20% always on      +8,655  +11,002   -2,347   +9,431     -776       6
+#     30% always on      +9,749   +4,384   +5,365   +5,631   +4,118       2
+#     15%, armed +10%   +15,648  +13,072   +2,576   +7,407   +8,241       7
+#     20%, armed +10%   +15,771   +7,895   +7,876   +7,905   +7,866       3
+#
+# Every always-on setting narrower than about 24% loses money over the second
+# half of the history and on the first account; their edge is entirely the
+# early beta period. The armed version is the only one flat across all four
+# splits, and it survives being triggered off five-minute lows rather than
+# closes (+12,699), so it is not an artifact of how the marks were sampled.
+#
+# It costs three winners -- PLTR 182.5C, IWM 300P, GLD 416P -- all three of
+# which it turns into small losses. That is the price, and it is already in the
+# +15,771. Twenty of twenty-three winners are untouched.
+# ---------------------------------------------------------------------------
+trailing_stop_pct: 0.20
+trailing_arm_pct: 0.10
+
+# ---------------------------------------------------------------------------
 # MINIMUM CONFIDENCE: 0.65, RAISED FROM 0.50
 #
 # The first thing on this project measured against outcomes rather than

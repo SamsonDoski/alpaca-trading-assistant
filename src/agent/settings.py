@@ -143,6 +143,37 @@ class Settings:
     # at +50.7% with its underlying target five percent away and no rule to take it.
     premium_target_backstop_pct: float = 0.50
 
+    # --- The trailing stop ---------------------------------------------------
+    # Sell when the premium falls this far below the highest mark the position
+    # has reached, but only once it has been `trailing_arm_pct` ahead at least
+    # once. Before that the trail is asleep and the -25% floor is the only
+    # premium rule.
+    #
+    # The arm is not a refinement, it is what makes the rule work at all. Run
+    # always-on, the high-water mark starts at the entry fill, so a 20% trail is
+    # just a tighter hard stop and it cuts the trades that dip before they run:
+    # replayed on five-minute marks over all 89 round trips with data, it sold
+    # TLT 78C -- the largest winner in the book, +85% -- at -22% on the opening
+    # wobble, and turned six winners into losses for +$8,655 net. With the arm
+    # at +10% those trades are untouched, because the trail is still asleep when
+    # they dip. Same replay: +$15,771, three winners cut instead of six.
+    #
+    # Width was measured rather than chosen. The deciding statistic is each
+    # trade's deepest pullback from its own running peak, since a trail of D
+    # fires exactly when that reaches D. Winners' pullbacks run to a 12% median
+    # and a 29% ninetieth percentile; losers' to a 31% median. Narrower settings
+    # score better in aggregate only because they also fire in the early beta
+    # period: 14%, 18% and 20% always-on all LOSE money over the second half of
+    # the history and on the first account. At 20% armed the result is flat
+    # across every split -- early +$7,895, late +$7,876, beta +$7,905, first
+    # +$7,866 -- and holds up when the trigger is read off five-minute lows
+    # instead of closes (+$12,699).
+    #
+    # Only the exits pass enforces this, so the five-minute schedule is part of
+    # the rule, not an operational detail. See the note at the top of exits.py.
+    trailing_stop_pct: float = 0.20
+    trailing_arm_pct: float = 0.10
+
     # Close this many days before expiry regardless of P&L. Decay accelerates into
     # the final week and the position stops behaving like the bet it was opened as.
     close_before_expiry: int = 7
