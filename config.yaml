@@ -437,6 +437,33 @@ min_confidence: 0.60
 min_setup_quality: 0
 
 # ---------------------------------------------------------------------------
+# SPREAD: TIGHTENED TO 0.08 FROM 0.15, 29 OCT 2026
+#
+# Stated here rather than left to the default because the default was not
+# overridden and nobody looking at this file would have known the limit was
+# 15%. A risk limit that only exists in Python is a limit you forget you have.
+#
+# What this number is NOT: a cost. The free Basic plan serves Alpaca's
+# INDICATIVE feed, which quoted MSFT at 12.5% and AAPL at 12.7% on 31 Aug 2026
+# -- two of the most liquid option markets in existence, which really trade
+# near 1-2%. So "13.5% wide" does not mean 13.5% will be paid.
+#
+# What it IS: a liquidity ranking. The inflated number still orders contracts
+# correctly, and across the 23 closed entries with metrics the order predicts
+# outcomes -- 0.08 is the only limit positive in both time halves, and the
+# three trades it refuses lost 7,822 between them. The full sweep is in
+# settings.py beside the field.
+#
+# Expect roughly a quarter fewer entries: 9 of the 34 recorded so far quoted
+# above 8%, including both V calls at 13.5% and 13.7%.
+#
+# Open interest would measure this without the feed in the way and remains the
+# better fix. It arrives NULL on every entry recorded so far, so there is
+# nothing to gate on until that is understood.
+# ---------------------------------------------------------------------------
+max_spread_pct: 0.08
+
+# ---------------------------------------------------------------------------
 # SIZE PER TRADE: 8% OF EQUITY, DOUBLED FROM 4%
 #
 # At 4% and roughly $86,000 of equity, a trade got about $3,400 -- which on a
