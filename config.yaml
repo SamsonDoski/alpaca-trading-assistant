@@ -238,7 +238,32 @@ correlation_groups:
   TSLA: consumer
 
 max_per_group: 2
-max_same_direction: 5
+
+# ---------------------------------------------------------------------------
+# DIRECTIONAL LEAN: TIGHTENED TO 4 FROM 5, 29 OCT 2026
+#
+# At 5 of 8 slots this cap permitted a book 62% one way, which is close enough
+# to no cap at all. Measured over 107 round trips to 22 Oct, the realised mix
+# was 64% calls, and the split by side was stark:
+#
+#       side     n   share   wins        net
+#       calls   68     64%    21%    -24,707
+#       puts    39     36%    36%     +3,054
+#
+# Every dollar of the drawdown is in the call side. Two months is one regime --
+# a falling one, which is why the puts paid -- so this is NOT a reason to tilt
+# bearish, and the number here is a cap on leaning either way.
+#
+# What it is a reason for: the gate's own argument. Eight positions across
+# eight sectors that are all long calls are one bet on the market going up,
+# and sector limits cannot see that. 4 of 8 forces the book to be able to be
+# wrong about direction without being wrong about everything.
+#
+# The system prompt has argued the same point at length under "UP AND DOWN ARE
+# THE SAME TRADE" since before any of these trades, and the realised 64% says
+# argument alone did not achieve it.
+# ---------------------------------------------------------------------------
+max_same_direction: 4
 
 # ---------------------------------------------------------------------------
 # PREMIUM RICHNESS: TIGHTENED TO 1.15 FROM 1.40
@@ -379,6 +404,37 @@ min_confidence: 0.60
 # Sonnet has not completed a single trade. It is a calibration to a distribution,
 # not to results. Re-derive it from outcomes once ~20 trades have closed.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# SETUP QUALITY: RECORDED FROM 29 OCT 2026, NOT YET GATING
+#
+# Why a second number exists at all. The prompt used to ask confidence to do
+# two incompatible jobs: be the probability the model would defend, and also
+# spread itself across the range so the agent could sort on it. Those conflict.
+# The honest probability of a correct four-week direction call on a liquid
+# large cap really is a modest lean, so a calibrated model clusters -- and
+# Sonnet does, with 94% of its directional opinions inside 0.55-0.64 and both
+# of its winners sitting at exactly the 0.60 floor. There was nothing left to
+# select on, and no threshold could have recovered it.
+#
+# So confidence is now asked for as a probability and nothing else, and the
+# relative judgement moved to its own field: 0-10, explicitly a RANK against
+# the typical symbol the model is shown. A rank spreads naturally, because it
+# is a comparison rather than an absolute, and nothing is distorted by using
+# the whole of it.
+#
+# 0 means this gate never refuses, which is deliberate. The number is being
+# recorded on every opinion and every entry and it decides nothing yet, for
+# the same reason the 0.60 floor should not have been trusted on arrival:
+# there is no outcome data behind it. Raise it once ~20 trades have closed
+# with a quality recorded, and raise it to whatever those outcomes say rather
+# than to whatever looks reasonable.
+#
+# Note the failure direction. A backend that does not return the field at all
+# yields 0, which passes while this is 0 and blocks the moment it is raised --
+# missing data blocking rather than permitting, as everywhere else here.
+# ---------------------------------------------------------------------------
+min_setup_quality: 0
 
 # ---------------------------------------------------------------------------
 # SIZE PER TRADE: 8% OF EQUITY, DOUBLED FROM 4%

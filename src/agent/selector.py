@@ -70,7 +70,7 @@ YOUR ONLY JOB IS TO RANK THEM.
 You cannot reject a candidate, add one, change a size, or alter a contract. Anything you leave out of your ranking is simply placed last. The risk rules have already decided what is allowed; you are deciding what is best.
 
 WHAT TO WEIGH
-- Conviction, but not alone. These confidence figures were produced in separate analyses with no knowledge of each other, so treat them as one input rather than as a scale you can trust to sort correctly.
+- Conviction, but not alone. These confidence figures were produced in separate analyses with no knowledge of each other, so treat them as one input rather than as a scale you can trust to sort correctly. Note that confidence is a probability and will not vary much between candidates; `qual` is the analyst's own 0-10 rank of the setup against the typical one it sees, and is the figure with room to separate them.
 - Premium richness (IV/RV). Below 1.0 means the option is priced for less movement than the stock has actually been delivering -- the favourable side for a buyer. Above 1.3 means paying up.
 - Daily decay. What the position loses each day the thesis takes to work.
 - Cost. A cheaper expression of a similar view leaves room for another position.
@@ -97,8 +97,8 @@ def render_slate(candidates: list[Candidate], settings: Settings,
         f"{len(candidates)} approved candidates, {slots} free slot(s).",
         "All have passed every risk check. Rank them best-first.",
         "",
-        f"  {'symbol':<8}{'dir':>5}{'conf':>6}{'IV/RV':>7}{'decay':>8}"
-        f"{'cost':>9}  group",
+        f"  {'symbol':<8}{'dir':>5}{'conf':>6}{'qual':>6}{'IV/RV':>7}"
+        f"{'decay':>8}{'cost':>9}  group",
     ]
 
     for c in candidates:
@@ -109,6 +109,7 @@ def render_slate(candidates: list[Candidate], settings: Settings,
             f"  {c.underlying:<8}"
             f"{c.draft.proposal.direction.value:>5}"
             f"{c.confidence:>6.2f}"
+            f"{c.draft.proposal.setup_quality:>5}/10"
             f"{(f'{richness:.2f}' if richness else '--'):>7}"
             f"{(f'{decay:.2%}' if decay else '--'):>8}"
             f"{c.draft.total_cost:>9,.0f}  {c.group}"

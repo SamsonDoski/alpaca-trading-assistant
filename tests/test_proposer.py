@@ -65,8 +65,9 @@ class FakeBackend:
 
 
 def answering(direction="up", confidence=0.75, rationale="steady uptrend",
-              reasoning="weighed the trend") -> FakeBackend:
-    return FakeBackend(RawVerdict(direction, confidence, rationale, reasoning))
+              reasoning="weighed the trend", setup_quality=6) -> FakeBackend:
+    return FakeBackend(RawVerdict(direction, confidence, rationale, reasoning,
+                                  setup_quality=setup_quality))
 
 
 # --- The proposer, whichever model answers --------------------------------
@@ -368,6 +369,32 @@ def test_a_non_numeric_confidence_raises():
         backend.ask("s", "u")
 
 
+def test_setup_quality_is_parsed_and_clamped():
+    backend, _ = openai_backend(
+        '{"direction": "up", "confidence": 0.6, "setup_quality": 14, "rationale": "x"}')
+    assert backend.ask("s", "u").setup_quality == 10
+
+
+def test_a_missing_setup_quality_is_zero_not_a_failure():
+    """Older open models were never prompted for this field. A missing rank
+    makes the setup unremarkable; it does not throw away a stated direction."""
+    backend, _ = openai_backend('{"direction": "up", "confidence": 0.6, "rationale": "x"}')
+    verdict = backend.ask("s", "u")
+    assert verdict.direction == "up"
+    assert verdict.setup_quality == 0
+
+
+def test_an_unparseable_setup_quality_is_zero_not_a_failure():
+    backend, _ = openai_backend(
+        '{"direction": "up", "confidence": 0.6, "setup_quality": "great", "rationale": "x"}')
+    assert backend.ask("s", "u").setup_quality == 0
+
+
+def test_the_json_instruction_asks_for_the_quality_field():
+    from agent.models import JSON_INSTRUCTION
+    assert "setup_quality" in JSON_INSTRUCTION
+
+
 def test_an_empty_answer_raises():
     backend, _ = openai_backend("")
     with pytest.raises(ModelUnavailable):
@@ -428,6 +455,27 @@ def test_an_unknown_provider_is_rejected():
         build_backend("nonesuch")
 
 
+def test_the_setup_rank_reaches_the_proposal():
+    proposal = Proposer(answering("up", 0.58, setup_quality=9)).propose(make_brief())
+    assert proposal.setup_quality == 9
+    # The two numbers are separate claims and must not be conflated: a modest
+    # probability on an exceptional setup is the case the split exists for.
+    assert proposal.confidence == pytest.approx(0.58)
+
+
+def test_declining_carries_no_setup_rank():
+    backend = FakeBackend(RawVerdict("none", 0.0, "nothing here", setup_quality=8))
+    proposal = Proposer(backend).propose(make_brief())
+    assert not proposal.is_actionable
+    assert proposal.setup_quality == 0
+
+
+def test_a_failed_call_carries_no_setup_rank():
+    proposal = Proposer(FakeBackend(error=RuntimeError("boom"))).propose(make_brief())
+    assert proposal.setup_quality == 0
+    assert not proposal.is_actionable
+
+
 # --- The brief the model reads --------------------------------------------
 
 def test_the_brief_reports_trend_and_range_position():
@@ -475,6 +523,29 @@ def test_a_brief_with_no_history_still_renders():
     assert "none listed in range" in text
 
 
+def test_the_brief_shows_what_the_stock_actually_does():
+    """IV on its own is a number. The model was told implied volatility says
+    whether a move is already paid for, and shown no baseline to judge it
+    against -- 28% on a metal and 28% on a staple mean opposite things."""
+    text = render_brief(make_brief())
+    assert "realized volatility" in text
+    assert "IV/RV" in text
+
+
+def test_the_brief_shows_how_far_away_the_stop_is():
+    """The prompt says the position is cut at about two average daily ranges.
+    Without the range, the model cannot tell whether its expected move clears
+    that distance."""
+    text = render_brief(make_brief())
+    assert "average daily range" in text
+    assert "the stop sits roughly" in text
+
+
+def test_the_brief_says_so_when_volatility_cannot_be_measured():
+    text = render_brief(make_brief(bars=10))
+    assert "IV/RV unavailable" in text
+
+
 # --- The schema -----------------------------------------------------------
 
 def test_confidence_is_bounded_by_the_schema():
@@ -485,6 +556,17 @@ def test_confidence_is_bounded_by_the_schema():
 def test_direction_is_restricted_to_three_answers():
     with pytest.raises(Exception):
         ProposalSchema(direction="sideways", confidence=0.5, rationale="drifting")
+
+
+def test_setup_quality_is_bounded_by_the_schema():
+    with pytest.raises(Exception):
+        ProposalSchema(direction="up", confidence=0.6, setup_quality=11,
+                       rationale="off the scale")
+
+
+def test_setup_quality_defaults_to_zero_when_the_model_omits_it():
+    assert ProposalSchema(direction="up", confidence=0.6,
+                          rationale="x").setup_quality == 0
 
 
 def test_a_long_rationale_is_accepted():

@@ -333,6 +333,23 @@ def test_a_decision_keeps_the_models_reasoning(journal):
     assert row.thinking == "weighed the trend"
 
 
+def test_a_decision_keeps_the_setup_rank_beside_the_probability(journal):
+    """Recorded on every opinion, not just the ones that traded. That is where
+    the sample size is, and where the floor will eventually be derived from."""
+    proposal = Proposal("AAPL", Direction.UP, 0.58, "modest lean",
+                        "weighed it", setup_quality=9)
+    journal.record_decision("AAPL", approved=True, reason="approved",
+                            proposal=proposal)
+    row = journal.decisions_for_day()[0]
+    assert row.confidence == pytest.approx(0.58)
+    assert row.setup_quality == 9
+
+
+def test_a_decision_with_no_proposal_records_no_rank(journal):
+    journal.record_decision("MSFT", approved=False, reason="already holding")
+    assert journal.decisions_for_day()[0].setup_quality is None
+
+
 def test_realised_and_lifetime_totals_add_up(journal):
     journal.record("closed", "AAPL", "A", "stop loss", pnl=-400)
     journal.record("closed", "MSFT", "M", "take profit", pnl=900)

@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS entry_metrics (
     underlying     TEXT NOT NULL,
     direction      TEXT NOT NULL,
     confidence     REAL,
+    setup_quality  INTEGER,    -- 0-10 rank of the setup, separate from the
+                               -- probability above; see gates.MinimumSetupQuality
     quantity       INTEGER,
     limit_price    REAL,       -- what we asked to pay, per share
     cost           REAL,       -- the whole position
@@ -128,6 +130,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     reason      TEXT NOT NULL,
     direction   TEXT,
     confidence  REAL,
+    setup_quality INTEGER,     -- 0-10, the model's rank of this setup
     rationale   TEXT,
     thinking    TEXT,
     gate_trace  TEXT             -- JSON: [[gate name, decision, reason], ...]
@@ -142,6 +145,8 @@ CREATE INDEX IF NOT EXISTS idx_decisions_day ON decisions(day DESC);
 # and fail on the first query that names it.
 _ADDED_COLUMNS = (
     ("holdings", "peak_premium", "REAL NOT NULL DEFAULT 0"),
+    ("decisions", "setup_quality", "INTEGER"),
+    ("entry_metrics", "setup_quality", "INTEGER"),
 )
 
 
@@ -211,6 +216,7 @@ class DecisionRow:
     confidence: float | None
     rationale: str | None
     thinking: str | None
+    setup_quality: int | None = None
 
 
 class Journal:
@@ -261,12 +267,14 @@ class Journal:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO decisions (at, day, underlying, approved, reason, "
-                "direction, confidence, rationale, thinking, gate_trace) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "direction, confidence, setup_quality, rationale, thinking, "
+                "gate_trace) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (now.isoformat(), now.date().isoformat(), underlying,
                  1 if approved else 0, reason,
                  proposal.direction.value if proposal else None,
                  proposal.confidence if proposal else None,
+                 proposal.setup_quality if proposal else None,
                  proposal.rationale if proposal else None,
                  proposal.thinking_summary if proposal else None,
                  encoded),
@@ -565,12 +573,13 @@ class Journal:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT at, underlying, approved, reason, direction, confidence, "
-                "rationale, thinking FROM decisions WHERE day = ? "
+                "setup_quality, rationale, thinking FROM decisions WHERE day = ? "
                 "ORDER BY id DESC LIMIT ?", (target, limit)).fetchall()
         return [DecisionRow(at=r["at"], underlying=r["underlying"],
                             approved=bool(r["approved"]), reason=r["reason"],
                             direction=r["direction"], confidence=r["confidence"],
-                            rationale=r["rationale"], thinking=r["thinking"])
+                            rationale=r["rationale"], thinking=r["thinking"],
+                            setup_quality=r["setup_quality"])
                 for r in rows]
 
     def directional_views(self, *, since: str | None = None) -> list[dict]:
@@ -588,6 +597,7 @@ class Journal:
         """
         sql = (
             "SELECT day, underlying, direction, MAX(confidence) AS confidence, "
+            "       MAX(setup_quality) AS setup_quality, "
             "       MAX(approved) AS traded, "
             "       MIN(reason) AS reason "
             "FROM decisions "
