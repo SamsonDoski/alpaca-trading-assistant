@@ -88,12 +88,33 @@ class Settings:
     # 31 Aug 2026 showed MSFT at 12.5% and AAPL at 12.7% -- two of the most liquid
     # option markets in existence, which genuinely trade near 1-2%.
     #
-    # So at 0.15 this is a SANITY rule, rejecting quotes that are broken rather
-    # than merely inflated. It rests on the unverified assumption that reported
-    # spreads on liquid names overstate the truth by about an order of magnitude;
-    # if one is ever genuine, this gate will let us pay it. Gating on open interest
-    # would be feed-independent and is the better long-term fix.
-    max_spread_pct: float = 0.15
+    # At 0.15 it was a SANITY rule, rejecting quotes that were broken rather than
+    # merely inflated, on the unverified assumption that reported spreads overstate
+    # the truth by about an order of magnitude.
+    #
+    # 0.08 from 29 Oct 2026, and the reasoning has changed with it. The number is
+    # still not a cost -- on an indicative feed it cannot be read as "you will pay
+    # this to cross". What the 23 entries with metrics recorded show is that it
+    # still ORDERS the contracts correctly, and that the order predicts:
+    #
+    #     limit    kept   cut   net kept   net cut   early / late
+    #     0.06       17     6     +3,419    -3,330    -2,434 / +5,853
+    #     0.08       20     3     +7,911    -7,822    +4,426 / +3,485
+    #     0.10       21     2     +5,751    -5,662    +4,426 / +1,325
+    #     0.15       23     0        +89        +0    +7,252 / -7,163
+    #
+    # 0.08 is the only limit positive in both halves, and the three trades it
+    # refuses -- KO at 13.5%, XLV at 10.7%, XLV at 9.6% -- lost 7,822 between
+    # them. The eras separate on the same axis: the DeepSeek weeks averaged 2.7%
+    # reported spread at a 46% win rate, the Sonnet weeks 6.0% at 20%. A lower
+    # confidence floor did not only admit weaker views, it admitted thinner
+    # contracts.
+    #
+    # So this is a LIQUIDITY rule now, reading an inflated number as a ranking
+    # rather than as a price. Open interest would say the same thing without the
+    # feed in the way, and is still the better fix -- but it arrives NULL on every
+    # one of the 34 entries recorded so far, so there is nothing to gate on yet.
+    max_spread_pct: float = 0.08
 
     # --- What the premium costs ---------------------------------------------
     # Reject a contract whose implied volatility exceeds the underlying's realized

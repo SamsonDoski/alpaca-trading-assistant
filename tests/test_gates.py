@@ -215,6 +215,27 @@ def test_wide_spread_is_refused():
     assert "wide" in outcome.reason
 
 
+def test_the_shipped_spread_limit_is_a_liquidity_rule_not_a_sanity_rule():
+    """0.08, down from 0.15. On an indicative feed the number is not a cost --
+    MSFT quoted 12.5% on a market that trades near 1-2% -- but it still ranks
+    liquidity, and across 23 closed entries the ranking predicted outcomes."""
+    assert Settings().max_spread_pct == 0.08
+
+
+def test_a_ten_percent_quote_is_refused_under_the_tightened_limit():
+    """KO went in at 13.5% and lost 3,382; both XLV entries were above 9.6%
+    and lost 2,280 and 2,160. These are the trades this limit exists to stop."""
+    # 4.75 / 5.25 is a 10% spread on a 5.00 midpoint.
+    outcome = authorise(make_draft(bid=4.75, ask=5.25), make_context())
+    assert not outcome.approved
+    assert "wide" in outcome.reason
+
+
+def test_a_quote_inside_the_limit_still_passes():
+    # 4.90 / 5.10 is a 4% spread -- the range the profitable weeks traded in.
+    assert authorise(make_draft(bid=4.90, ask=5.10), make_context()).approved
+
+
 def test_contract_with_no_quote_is_refused_not_treated_as_free():
     """A contract with no market must never look cheap to the spread gate."""
     outcome = authorise(make_draft(bid=0.0, ask=0.0), make_context())
