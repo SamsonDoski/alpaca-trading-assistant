@@ -73,6 +73,10 @@ class RawVerdict:
     confidence: float
     rationale: str
     reasoning: str = ""      # the model's own account of how it decided, if any
+    # 0-10 rank of the setup against the typical one. Defaults to 0 so a
+    # backend that cannot produce it still returns a valid verdict -- which
+    # passes while the floor is 0 and blocks once it is raised.
+    setup_quality: int = 0
 
 
 class ModelBackend(Protocol):
@@ -150,6 +154,7 @@ class AnthropicBackend:
             confidence=float(verdict.confidence),
             rationale=verdict.rationale,
             reasoning=_anthropic_thinking(response),
+            setup_quality=int(getattr(verdict, "setup_quality", 0) or 0),
         )
 
 
@@ -202,9 +207,9 @@ JSON_INSTRUCTION = """
 OUTPUT FORMAT
 Reply with a single JSON object and nothing else. No prose before or after it, no markdown fence.
 
-{"direction": "up" | "down" | "none", "confidence": <number between 0 and 1>, "rationale": "<one or two sentences>"}
+{"direction": "up" | "down" | "none", "confidence": <number between 0 and 1>, "setup_quality": <integer from 0 to 10>, "rationale": "<one or two sentences>"}
 
-Use "none" with confidence 0 when the evidence does not support either side."""
+Use "none" with confidence 0 and setup_quality 0 when the evidence does not support either side."""
 
 
 class OpenAICompatibleBackend:
@@ -283,6 +288,15 @@ class OpenAICompatibleBackend:
         except (TypeError, ValueError):
             raise ModelUnavailable("confidence was not a number") from None
 
+        # Absent or unparseable means 0, not a rejection. This field is newer
+        # than the schema most open models were prompted against, and a missing
+        # rank is a reason to treat the setup as unremarkable rather than a
+        # reason to throw away a direction the model did state.
+        try:
+            quality = int(round(float(payload.get("setup_quality", 0))))
+        except (TypeError, ValueError):
+            quality = 0
+
         return RawVerdict(
             direction=direction,
             # Clamped rather than rejected. A model answering 1.2 means "very
@@ -291,6 +305,7 @@ class OpenAICompatibleBackend:
             confidence=max(0.0, min(1.0, confidence)),
             rationale=str(payload.get("rationale", "")).strip()[:800],
             reasoning=reasoning,
+            setup_quality=max(0, min(10, quality)),
         )
 
 

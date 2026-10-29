@@ -309,9 +309,16 @@ class Proposal:
 
     underlying: str
     direction: Direction
-    confidence: float            # 0.0 to 1.0, the model's own stated conviction
+    confidence: float            # 0.0 to 1.0, the probability the call is right
     rationale: str               # a sentence or two, written for a human reader
     thinking_summary: str = ""   # the model's summarised reasoning, for the journal
+    # How good this opportunity is against the typical one the model is shown,
+    # 0 to 10. Separate from `confidence` because the two are different claims:
+    # a 0.58 probability on an exceptional setup and a 0.58 on a dull one are
+    # the same number and not the same trade. Asking confidence to carry both
+    # produced a near-constant value, since a calibrated probability on a
+    # four-week direction call genuinely has little room to move.
+    setup_quality: int = 0
 
     @property
     def is_actionable(self) -> bool:

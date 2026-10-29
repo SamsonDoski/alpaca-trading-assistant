@@ -42,6 +42,17 @@ class Settings:
     # at the midpoint so "unsure" costs nothing -- the next pass is 15 minutes on.
     min_confidence: float = 0.5
 
+    # The model's own rank of this setup against the typical one it is shown,
+    # 0 to 10. A separate number from confidence because they answer different
+    # questions: confidence is the probability the call is right, this is how
+    # good an opportunity it is relative to the others. Asking one number to do
+    # both made a calibrated model cluster, which left nothing to sort on.
+    #
+    # 0 disables the gate, which is the default on purpose -- the field has no
+    # outcome data behind it yet. A backend that omits it yields 0, so raising
+    # this floor also starts blocking anything that cannot report one.
+    min_setup_quality: int = 0
+
     # --- Concentration ------------------------------------------------------
     # Which symbols move together. Declared rather than computed: a rolling
     # correlation matrix would be more precise and also unstable, expensive, and
@@ -55,7 +66,7 @@ class Settings:
 
     # Sector limits catch "all technology"; this catches eight well-spread sectors
     # that are all long calls, which is still one bet on the market going up.
-    max_same_direction: int = 5
+    max_same_direction: int = 4
 
     # --- Contract selection -------------------------------------------------
     # Slightly in the money. Near 0.65 delta an option moves about 65 cents per

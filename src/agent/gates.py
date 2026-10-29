@@ -309,6 +309,43 @@ class MinimumConfidence:
 
 
 @dataclass(frozen=True, slots=True)
+class MinimumSetupQuality:
+    """Discards setups the model ranks as ordinary.
+
+    The companion to `MinimumConfidence`, and a different question. Confidence
+    is the probability the direction is right; this is where the setup sits
+    against the others the model is shown. Both at 0.58 confidence, an
+    exceptional setup and a dull one are indistinguishable to the gate above
+    and separable here.
+
+    The split exists because asking confidence to carry both collapsed it. A
+    calibrated probability on a four-week direction call has very little room
+    to move -- 94% of Sonnet's directional opinions landed inside 0.55 to 0.64 --
+    so there was nothing to sort on, and no floor could have found any. A rank
+    has room by construction.
+
+    **Off by default, and that is the point.** `min_setup_quality` is 0 on
+    arrival, so this refuses nothing while the field accumulates alongside
+    outcomes. The 0.60 confidence floor was set from a distribution rather
+    than from results and has still not been validated; repeating that with a
+    second number on the same day would be the same mistake twice.
+    """
+
+    name: str = "minimum_setup_quality"
+
+    def check(self, draft: OrderDraft, ctx: GateContext) -> Verdict:
+        floor = ctx.settings.min_setup_quality
+        if floor <= 0:
+            return Verdict.allow()
+
+        stated = draft.proposal.setup_quality
+        if stated < floor:
+            return Verdict.deny(
+                f"setup quality {stated}/10 is below the {floor}/10 floor")
+        return Verdict.allow()
+
+
+@dataclass(frozen=True, slots=True)
 class DeltaBand:
     """Keeps the contract in the intended part of the chain.
 
@@ -572,6 +609,7 @@ ENTRY_GATES: tuple[EntryGate, ...] = (
 
 ORDER_GATES: tuple[OrderGate, ...] = (
     MinimumConfidence(),
+    MinimumSetupQuality(),
     DirectionalBalance(),
     DeltaBand(),
     SpreadWidth(),

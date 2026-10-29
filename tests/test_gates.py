@@ -62,12 +62,14 @@ def make_contract(**overrides) -> OptionContract:
     return OptionContract(**{**defaults, **overrides})
 
 
-def make_draft(quantity: int = 1, confidence: float = 0.8, **contract_overrides) -> OrderDraft:
+def make_draft(quantity: int = 1, confidence: float = 0.8,
+               setup_quality: int = 5, **contract_overrides) -> OrderDraft:
     proposal = Proposal(
         underlying="AAPL",
         direction=Direction.UP,
         confidence=confidence,
         rationale="test proposal",
+        setup_quality=setup_quality,
     )
     contract = make_contract(**contract_overrides)
     # Spot and realized volatility make the contract internally coherent: a
@@ -280,6 +282,25 @@ def test_no_groups_configured_means_no_cap():
     assert screen("AAPL", make_context(open_positions=held)).approved
 
 
+def test_the_shipped_lean_limit_leaves_room_for_the_other_side():
+    """4 of 8 slots. At 5 the cap permitted a book 62% one way, and the
+    realised mix over 107 round trips was 64% calls -- every dollar of the
+    drawdown on that side. The cap is on leaning either way, not on calls.
+    """
+    settings = Settings()
+    assert settings.max_same_direction == 4
+    # A cap equal to the slot count is not a cap. This is what makes it bite.
+    assert settings.max_same_direction < settings.max_positions
+
+
+def test_a_book_at_the_tightened_lean_limit_is_refused():
+    held = tuple(make_position(s) for s in ("SPY", "GLD", "TLT", "XLE"))
+    ctx = make_context(open_positions=held, settings=Settings())
+    outcome = authorise(make_draft(quantity=1), ctx)
+    assert not outcome.approved
+    assert "lean bullish" in outcome.reason
+
+
 def test_a_book_leaning_entirely_one_way_is_refused():
     """Eight well-spread sectors that are all long calls is still one bet."""
     held = tuple(make_position(s) for s in ("SPY", "GLD", "TLT", "XLE", "EEM"))
@@ -301,6 +322,56 @@ def test_puts_and_calls_are_counted_separately():
     held = tuple(make_position(s, right="put") for s in ("SPY", "GLD", "TLT"))
     ctx = make_context(open_positions=held, settings=Settings(max_same_direction=3))
     assert authorise(make_draft(quantity=1), ctx).approved
+
+
+# --- Setup quality --------------------------------------------------------
+#
+# The second half of the confidence split. Confidence is the probability the
+# direction is right; this is the model's rank of the setup against the typical
+# one it sees. Off until there are outcomes to set it from, so most of these
+# are about it staying out of the way.
+
+def test_setup_quality_refuses_nothing_while_the_floor_is_zero():
+    """The shipped default. The field is recorded and decides nothing."""
+    ctx = make_context(settings=Settings(min_setup_quality=0))
+    assert authorise(make_draft(setup_quality=0), ctx).approved
+
+
+def test_a_zero_floor_passes_a_setup_the_model_called_worthless():
+    ctx = make_context(settings=Settings(min_setup_quality=0))
+    outcome = authorise(make_draft(setup_quality=0), ctx)
+    assert outcome.approved
+    names = [name for name, v in outcome.trace if v.decision.value != "allow"]
+    assert names == []
+
+
+def test_an_ordinary_setup_is_refused_once_the_floor_is_raised():
+    ctx = make_context(settings=Settings(min_setup_quality=7))
+    outcome = authorise(make_draft(setup_quality=5), ctx)
+    assert not outcome.approved
+    assert "5/10" in outcome.reason and "7/10" in outcome.reason
+
+
+def test_a_setup_at_the_floor_is_allowed():
+    ctx = make_context(settings=Settings(min_setup_quality=7))
+    assert authorise(make_draft(setup_quality=7), ctx).approved
+
+
+def test_a_missing_quality_blocks_once_the_floor_is_raised():
+    """A backend that cannot report the rank yields 0, and 0 is not a pass.
+
+    The house rule everywhere else: unmeasured is not the same as acceptable.
+    """
+    ctx = make_context(settings=Settings(min_setup_quality=1))
+    assert not authorise(make_draft(setup_quality=0), ctx).approved
+
+
+def test_quality_and_confidence_are_independent_refusals():
+    """A confident read of a dull setup, and a tentative read of a good one."""
+    ctx = make_context(settings=Settings(min_confidence=0.6, min_setup_quality=7))
+    assert not authorise(make_draft(confidence=0.9, setup_quality=3), ctx).approved
+    assert not authorise(make_draft(confidence=0.4, setup_quality=9), ctx).approved
+    assert authorise(make_draft(confidence=0.7, setup_quality=8), ctx).approved
 
 
 # --- What the premium costs -----------------------------------------------
@@ -470,7 +541,8 @@ def test_every_verdict_in_a_trace_has_a_reason_when_it_refuses():
 def test_the_trace_records_every_gate_that_ran():
     outcome = authorise(make_draft(quantity=1), make_context())
     names = [name for name, _ in outcome.trace]
-    assert names == ["minimum_confidence", "directional_balance", "delta_band",
+    assert names == ["minimum_confidence", "minimum_setup_quality",
+                     "directional_balance", "delta_band",
                      "spread_width", "expiry_window", "premium_richness",
                      "decay_burden", "risk_budget", "buying_power"]
 
