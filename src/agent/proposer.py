@@ -59,20 +59,33 @@ class ProposalSchema(BaseModel):
                     "the number you would defend, not a number chosen to look "
                     "decisive -- setup_quality is where relative judgement "
                     "belongs.")
-    setup_quality: int = Field(
-        ge=0, le=10, default=0,
+    # Unconstrained on purpose, and rounded and clamped by the backend instead.
+    # Shipped with `ge=0, le=10` on 29 Oct 2026 and it cost seven opinions in
+    # one session: a 6.5, an 11 or a null discarded the direction, the
+    # confidence and the rationale along with it. That is the mistake the
+    # `confidence` note below already warns about, made in a new field on the
+    # same day it was added.
+    #
+    # The schema's job is to describe what we want. Deciding what to do with
+    # what we get belongs in code, where a bad value costs one number rather
+    # than a whole answer.
+    setup_quality: float | None = Field(
+        default=None,
         description="How good this opportunity is compared with the typical "
-                    "symbol you are shown, from 0 to 10. A rank, not a "
-                    "probability: 0 unremarkable, 5 an ordinary setup, 10 "
-                    "among the best you ever see. Use the whole range -- it "
-                    "is relative, so spreading it out costs nothing.")
-    # 800, not 400. A live pass lost a decision to a ValidationError because
-    # the model wrote a 430-character rationale -- it failed closed, so nothing
-    # unsafe happened, but a well-reasoned answer was thrown away over
-    # formatting. The cap exists to stop an essay reaching Discord, not to
-    # referee sentence length, so it is set where an essay actually starts.
+                    "symbol you are shown, a whole number from 0 to 10. A "
+                    "rank, not a probability: 0 unremarkable, 5 an ordinary "
+                    "setup, 10 among the best you ever see. Use the whole "
+                    "range -- it is relative, so spreading it out costs "
+                    "nothing.")
+    # No cap here either, for the same reason, and this one has a history. The
+    # limit was 400 and a live pass lost a decision because the model wrote 430
+    # characters; it was raised to 800, and on 30 Oct 2026 the model started
+    # answering in two paragraphs. Raising a cap that throws away good answers
+    # only moves the next failure further out.
+    #
+    # The cap exists to stop an essay reaching Discord. Truncating does that
+    # and keeps the decision, so the backend truncates.
     rationale: str = Field(
-        max_length=800,
         description="One or two sentences explaining the call, written for a "
                     "human reading a trade log later.")
 
@@ -267,7 +280,14 @@ class Proposer:
             # "analysis unavailable (ValidationError)" told us something broke
             # but not what, and the difference between a rate limit and a schema
             # violation is the difference between waiting and fixing.
-            detail = str(exc).strip().splitlines()[0][:160] if str(exc).strip() else ""
+            # The whole message, flattened, not just its first line. A pydantic
+            # failure spends line one saying "1 validation error for
+            # ProposalSchema" and names the offending FIELD on line two, so
+            # keeping only the first line reported that something was rejected
+            # while withholding the one word needed to fix it. Seven opinions
+            # were lost on 30 Oct 2026 before the field was identified by
+            # reproducing the schema locally.
+            detail = " ".join(str(exc).split())[:240]
             return _no_view(
                 brief.underlying,
                 f"analysis unavailable ({type(exc).__name__}"

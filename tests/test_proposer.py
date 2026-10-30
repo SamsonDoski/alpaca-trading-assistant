@@ -25,6 +25,7 @@ from agent.models import (
     OpenAICompatibleBackend,
     RawVerdict,
     build_backend,
+    normalise_quality,
 )
 from agent.proposer import ProposalSchema, Proposer, render_brief
 
@@ -375,6 +376,19 @@ def test_setup_quality_is_parsed_and_clamped():
     assert backend.ask("s", "u").setup_quality == 10
 
 
+def test_a_validation_failure_names_the_field_that_broke():
+    """The reason reaches Discord. "1 validation error for ProposalSchema" says
+    something was rejected and withholds the one word needed to fix it."""
+    import pydantic
+    try:
+        ProposalSchema(direction="up", confidence=5.0, rationale="x")
+    except pydantic.ValidationError as exc:
+        err = exc
+    proposal = Proposer(FakeBackend(error=err)).propose(make_brief())
+    assert "confidence" in proposal.rationale
+    assert not proposal.is_actionable
+
+
 def test_a_missing_setup_quality_is_zero_not_a_failure():
     """Older open models were never prompted for this field. A missing rank
     makes the setup unremarkable; it does not throw away a stated direction."""
@@ -558,15 +572,37 @@ def test_direction_is_restricted_to_three_answers():
         ProposalSchema(direction="sideways", confidence=0.5, rationale="drifting")
 
 
-def test_setup_quality_is_bounded_by_the_schema():
-    with pytest.raises(Exception):
-        ProposalSchema(direction="up", confidence=0.6, setup_quality=11,
-                       rationale="off the scale")
+# These four cost seven opinions in a single session on 30 Oct 2026. The field
+# carried `ge=0, le=10`, so a 6.5 or an 11 raised a ValidationError and the
+# direction, the confidence and the rationale went with it.
+
+@pytest.mark.parametrize("answered", [6.5, 11, -1, None, "7", 7.0])
+def test_an_odd_setup_quality_never_discards_the_whole_answer(answered):
+    schema = ProposalSchema(direction="up", confidence=0.6,
+                            setup_quality=answered, rationale="still useful")
+    assert schema.direction == "up"
+    assert schema.rationale == "still useful"
 
 
-def test_setup_quality_defaults_to_zero_when_the_model_omits_it():
-    assert ProposalSchema(direction="up", confidence=0.6,
-                          rationale="x").setup_quality == 0
+@pytest.mark.parametrize("answered,expected", [
+    (6.5, 7), (6.4, 6), (11, 10), (99, 10), (-1, 0), (None, 0),
+    ("7", 7), (7.0, 7), ("rubbish", 0),
+])
+def test_the_rank_is_rounded_and_clamped_not_rejected(answered, expected):
+    assert normalise_quality(answered) == expected
+
+
+def test_a_long_rationale_is_truncated_not_discarded():
+    """The cap was 400, a live pass lost a decision at 430, it went to 800, and
+    the model started answering in two paragraphs. Raising it only moves the
+    next failure further out."""
+    schema = ProposalSchema(direction="up", confidence=0.6, setup_quality=6,
+                            rationale="x" * 2000)
+    assert schema.direction == "up"
+    backend, _ = openai_backend(
+        '{"direction": "up", "confidence": 0.6, "setup_quality": 6, "rationale": "'
+        + "x" * 2000 + '"}')
+    assert len(backend.ask("s", "u").rationale) == 800
 
 
 def test_a_long_rationale_is_accepted():
