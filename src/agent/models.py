@@ -61,6 +61,37 @@ MAX_TOKENS = 16_000
 OPENAI_MAX_TOKENS = 8_000
 
 
+MAX_RATIONALE = 800
+
+
+def normalise_quality(value) -> int:
+    """Turn whatever the model reported for the rank into 0-10.
+
+    Rounded and clamped rather than rejected, which is the convention the
+    confidence field has followed since the first open model answered 1.4. The
+    alternative was measured: with `ge=0, le=10` enforced in the schema, a 6.5
+    or an 11 raised a ValidationError that discarded the direction and the
+    rationale with it, seven times in one session on 30 Oct 2026.
+
+    None means the model did not answer, which reads as 0 -- unremarkable, and
+    blocked the moment `min_setup_quality` is raised above it.
+
+    Rounds half UP rather than using `round()`, which is banker's rounding and
+    would send 6.5 down to 6 while sending 7.5 up to 8. On a rank a person will
+    read beside its own anchors, that asymmetry is a surprise with nothing to
+    recommend it.
+    """
+    if value is None:
+        return 0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if number != number:          # NaN, which no comparison below would catch
+        return 0
+    return int(max(0.0, min(10.0, number)) + 0.5)
+
+
 class ModelUnavailable(RuntimeError):
     """The model could not be reached, or would not answer usefully."""
 
@@ -152,9 +183,9 @@ class AnthropicBackend:
         return RawVerdict(
             direction=verdict.direction,
             confidence=float(verdict.confidence),
-            rationale=verdict.rationale,
+            rationale=(verdict.rationale or "")[:MAX_RATIONALE],
             reasoning=_anthropic_thinking(response),
-            setup_quality=int(getattr(verdict, "setup_quality", 0) or 0),
+            setup_quality=normalise_quality(getattr(verdict, "setup_quality", None)),
         )
 
 
@@ -288,24 +319,15 @@ class OpenAICompatibleBackend:
         except (TypeError, ValueError):
             raise ModelUnavailable("confidence was not a number") from None
 
-        # Absent or unparseable means 0, not a rejection. This field is newer
-        # than the schema most open models were prompted against, and a missing
-        # rank is a reason to treat the setup as unremarkable rather than a
-        # reason to throw away a direction the model did state.
-        try:
-            quality = int(round(float(payload.get("setup_quality", 0))))
-        except (TypeError, ValueError):
-            quality = 0
-
         return RawVerdict(
             direction=direction,
             # Clamped rather than rejected. A model answering 1.2 means "very
             # sure", and refusing the whole answer over a value out of range
             # would discard reasoning that is otherwise fine.
             confidence=max(0.0, min(1.0, confidence)),
-            rationale=str(payload.get("rationale", "")).strip()[:800],
+            rationale=str(payload.get("rationale", "")).strip()[:MAX_RATIONALE],
             reasoning=reasoning,
-            setup_quality=max(0, min(10, quality)),
+            setup_quality=normalise_quality(payload.get("setup_quality")),
         )
 
 
