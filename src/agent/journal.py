@@ -348,6 +348,46 @@ class Journal:
             )
         return replace(holding, peak_premium=mark)
 
+    def correct_entry_premium(self, holding: Holding, fill: float) -> Holding:
+        """Replace the limit recorded at order time with the price actually paid.
+
+        `open_holding` runs when the order is SENT, so the only premium it can
+        record is the limit. A buy limit fills at or below itself, so every row
+        starts life overstating what the position cost.
+
+        The cost figure alone would be a reporting problem. The peak is seeded
+        from the same number, and that is the part that changes behaviour: the
+        position opens with a high-water mark it never traded at, and until a
+        real mark passes the old limit the trailing stop measures down from a
+        price that never existed -- arming early, off a phantom high.
+
+        So the peak is pulled down too, but only while it is still the seed.
+        `peak_premium <= entry_premium` is true exactly when `raise_peak` has
+        never fired, which is what makes this safe to run on every pass: a
+        genuine high is never walked back. A zero peak is left alone -- those
+        are rows written before the column existed, and the exit rules
+        deliberately leave them untrailed rather than inventing a level.
+
+        Cheap to call repeatedly. Once the row holds the fill there is nothing
+        to do and it returns without touching the database.
+        """
+        if fill <= 0 or holding.entry_premium == fill:
+            return holding
+
+        seeded = 0 < holding.peak_premium <= holding.entry_premium
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE holdings SET "
+                "  peak_premium = CASE "
+                "    WHEN peak_premium > 0 AND peak_premium <= entry_premium "
+                "    THEN ? ELSE peak_premium END, "
+                "  entry_premium = ? "
+                "WHERE occ_symbol = ?",
+                (fill, fill, holding.occ_symbol),
+            )
+        return replace(holding, entry_premium=fill,
+                       peak_premium=fill if seeded else holding.peak_premium)
+
     def close_holding(self, occ_symbol: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM holdings WHERE occ_symbol = ?", (occ_symbol,))

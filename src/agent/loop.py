@@ -406,8 +406,15 @@ async def run_pass(
         # on every pass, before the check and whether or not anything closes,
         # because a peak that is not written while the position is at it is
         # gone -- the next pass reads a price, not a history.
+        #
+        # The row is corrected first. `open_holding` runs at submission, so the
+        # only premium it can record is the limit; the broker knows what was
+        # actually paid, and this is the first place both are in hand. The peak
+        # is seeded from that same limit, which is why it has to be put right
+        # BEFORE the mark is applied rather than after.
         holding = journal.holding(position.occ_symbol)
         if holding is not None:
+            holding = journal.correct_entry_premium(holding, position.entry_price)
             holding = journal.raise_peak(holding, position.current_price)
 
         decision = check_exit(position, settings, today,

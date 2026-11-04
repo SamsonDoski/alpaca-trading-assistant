@@ -918,6 +918,76 @@ def test_the_peak_is_raised_and_never_lowered(journal):
     assert journal.holding("AAPL261016C00310000").peak_premium == 14.00
 
 
+OCC = "AAPL261016C00310000"
+
+
+def _ordered(journal, *, limit: float):
+    """A holding as `open_holding` writes it: priced at the limit, peak seeded
+    from the same number."""
+    journal.open_holding(occ_symbol=OCC, underlying="AAPL", direction="up",
+                         entry_spot=313.0, entry_premium=limit,
+                         stop_spot=280.0, target_spot=360.0)
+    return journal.holding(OCC)
+
+
+def test_the_fill_replaces_the_limit_and_takes_the_seeded_peak_with_it(journal):
+    """A buy limit fills at or below itself, so the recorded premium is always
+    too high until the broker is consulted. The peak matters more than the cost:
+    left at the limit it is a high the position never traded at, and the trailing
+    stop would measure down from it."""
+    holding = journal.correct_entry_premium(_ordered(journal, limit=10.00), 9.60)
+
+    assert holding.entry_premium == 9.60
+    assert holding.peak_premium == 9.60
+    stored = journal.holding(OCC)
+    assert stored.entry_premium == 9.60
+    assert stored.peak_premium == 9.60
+
+
+def test_a_peak_a_real_mark_raised_is_not_walked_back(journal):
+    """The whole point of the guard. This runs on every pass, so it has to be
+    able to tell a seeded peak from one the position actually reached."""
+    holding = journal.raise_peak(_ordered(journal, limit=10.00), 14.00)
+    holding = journal.correct_entry_premium(holding, 9.60)
+
+    assert holding.entry_premium == 9.60
+    assert holding.peak_premium == 14.00
+    assert journal.holding(OCC).peak_premium == 14.00
+
+
+def test_a_zero_peak_stays_zero(journal):
+    """Rows from before the peak column carry zero, and the exit rules leave
+    those untrailed on purpose. Writing a level into one would arm a trailing
+    stop against a high that was never observed."""
+    _ordered(journal, limit=10.00)
+    with sqlite3.connect(journal.path) as conn:
+        conn.execute("UPDATE holdings SET peak_premium = 0")
+    holding = journal.correct_entry_premium(journal.holding(OCC), 9.60)
+
+    assert holding.entry_premium == 9.60
+    assert holding.peak_premium == 0.0
+    assert journal.holding(OCC).peak_premium == 0.0
+
+
+def test_a_row_already_holding_the_fill_is_left_untouched(journal):
+    """Called once per position per pass, so the common case must cost nothing
+    and must not disturb a peak that has since moved."""
+    holding = journal.raise_peak(_ordered(journal, limit=10.00), 14.00)
+    holding = journal.correct_entry_premium(holding, 9.60)
+    again = journal.correct_entry_premium(holding, 9.60)
+
+    assert again is holding
+    assert journal.holding(OCC).peak_premium == 14.00
+
+
+def test_nothing_is_corrected_from_a_missing_broker_price(journal):
+    """A position read without an entry price is a bad read, not a free fill."""
+    holding = _ordered(journal, limit=10.00)
+
+    assert journal.correct_entry_premium(holding, 0.0) is holding
+    assert journal.holding(OCC).entry_premium == 10.00
+
+
 def test_a_journal_written_before_the_peak_column_existed_still_opens(tmp_path):
     """`CREATE TABLE IF NOT EXISTS` is a no-op against a live database, so the
     column has to be added separately or both deployed accounts break on the
@@ -1266,6 +1336,44 @@ def test_a_later_fill_is_announced_once_on_the_pass_that_sees_it(journal):
     detail = _events(journal, "opened")[0].detail
     assert "filled 2 at 15.90" in detail
     assert "ordered as AAPL call x2" in detail
+
+
+def test_a_pass_corrects_the_recorded_premium_to_what_was_paid(journal):
+    """The limit went out at 16.00 and the broker filled it at 15.90, so the row
+    and its seeded peak are both 10c too high until a pass reconciles them.
+
+    Checked through `run_pass` rather than against the journal directly because
+    the correction has to reach the row the exit rules read, on an ordinary pass,
+    without anything having to close."""
+    journal.open_holding(occ_symbol="AAPL261016C00310000", underlying="AAPL",
+                         direction="up", entry_spot=313.0, entry_premium=16.00,
+                         stop_spot=300.0, target_spot=340.0)
+    held = position("AAPL", entry=15.90, current=15.90)
+
+    run(FakeReader(positions=(held,)), FakeExecutor(), FakeProposer({}),
+        journal, RecordingNotifier())
+
+    corrected = journal.holding("AAPL261016C00310000")
+    assert corrected.entry_premium == 15.90
+    assert corrected.peak_premium == 15.90      # the phantom high is gone
+
+
+def test_a_pass_leaves_a_real_peak_alone_while_correcting_the_premium(journal):
+    """Same correction on a position that has since traded well above its limit.
+    The peak is now a price the position actually reached, and the trailing stop
+    measures down from it -- lowering it would hand back a protected gain."""
+    journal.open_holding(occ_symbol="AAPL261016C00310000", underlying="AAPL",
+                         direction="up", entry_spot=313.0, entry_premium=16.00,
+                         stop_spot=300.0, target_spot=340.0)
+    journal.raise_peak(journal.holding("AAPL261016C00310000"), 21.00)
+    held = position("AAPL", entry=15.90, current=20.00)
+
+    run(FakeReader(positions=(held,)), FakeExecutor(), FakeProposer({}),
+        journal, RecordingNotifier())
+
+    corrected = journal.holding("AAPL261016C00310000")
+    assert corrected.entry_premium == 15.90
+    assert corrected.peak_premium == 21.00
 
 
 def test_an_order_that_never_fills_is_recorded_but_not_announced(journal):
