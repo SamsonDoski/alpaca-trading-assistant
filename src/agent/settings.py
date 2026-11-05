@@ -32,11 +32,26 @@ class Settings:
     # candidates rather than adding more of the same trades.
     max_positions: int = 5
 
-    # Days before re-entering an underlying after a STOP LOSS. Never after a win.
-    # Added because a live run re-bought a name minutes after stopping out on the
-    # same signal. A sweep of 0/1/2/3/5 was jagged, but 2 is positive in both
-    # halves and fixes the behaviour actually observed.
-    cooldown_days: int = 2
+    # Trading sessions before re-entering an underlying the agent CLOSED -- win
+    # or loss, whatever reason the close carries. `Journal.cooling_off` holds the
+    # rule and the replay that widened it; this is only its length.
+    #
+    # 1 session, down from 2 on 5 Nov 2026. The same replay that measured the
+    # rule measured its length, over 157 entries across both accounts from 3 Sep
+    # to 5 Nov, and the two numbers separate cleanly: all four profitable
+    # re-entries happened within ONE session, so every window from 1 upward
+    # gives up the same $8,865 of gains and only the losses avoided change --
+    # $10,479 at one session, $12,231 at two. The second session buys about
+    # $1,750 of the effect and costs a full extra day of the watchlist.
+    #
+    # That cost was observed, not projected. On 5 Nov the default account closed
+    # six positions and then selected nothing at all for the remaining two hours
+    # of the session. At roughly three closes a day against a fifteen-name
+    # watchlist, two sessions hold about eight names out at once, and the
+    # confidence floor refuses most of what is left. One session keeps the whole
+    # same-session re-entry effect -- which is where every dollar of the damage
+    # was -- and hands the universe back the next morning.
+    cooldown_days: int = 1
 
     # Below this the model's own stated conviction is recorded and discarded. Set
     # at the midpoint so "unsure" costs nothing -- the next pass is 15 minutes on.
@@ -242,6 +257,7 @@ class Settings:
     # at 0.8, four stops meant for -25% filled between -27% and -33%, turning a 2:1
     # rule into 1.6:1 and lifting the break-even win rate from 33% to about 38%.
     exit_aggression: float = 1.0
+
 
     @property
     def take_profit_pct(self) -> float:
