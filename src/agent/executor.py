@@ -58,7 +58,7 @@ class NotAPaperAccount(ExecutionError):
     """The configured credentials are not a paper account. Refuse everything."""
 
 
-def _filled_quantity(order: dict) -> float:
+def filled_quantity(order: dict) -> float:
     """How much of an order actually filled, whatever the field looks like.
 
     The CLI returns these as strings, and an unfilled order may report "0",
@@ -314,6 +314,54 @@ class CliExecutor:
             logger.info("could not cancel %s: %s", order_id, exc)
             return False
 
+    def reprice_buy_limit(self, symbol: str, quantity: int, limit_price: float,
+                          order_id: str) -> OrderReceipt | None:
+        """Re-place a resting buy order at a new limit. None if it could not be.
+
+        Deliberately NOT expressed as another `buy_to_open`, and the difference
+        is the safety property. `buy_to_open` takes an OrderDraft, which only
+        the gate chain can approve, because placing an order is a decision to
+        trade. Re-pricing is not. The gates made that decision when the order
+        was first sent; this method exists to keep the same order alive against
+        a moving quote, so it accepts no draft and can express no new trade.
+        Symbol, side and quantity come from the order already resting at the
+        broker, and price is the only thing it is able to change.
+
+        Cancel first, then submit, rather than amending in place: `order
+        replace` is not a command this CLI exposes. The gap between the two is
+        harmless here for the same reason entries are patient at all -- a missed
+        entry costs an opportunity that returns on the next pass.
+
+        **Returns None without submitting anything when the cancel fails.** The
+        usual reason a cancel fails is that the order has just filled, and that
+        is precisely the race in which submitting anyway would buy the position
+        a second time.
+        """
+        self.verify_paper()
+
+        if not self.cancel(order_id):
+            logger.info("not re-pricing %s: order %s would not cancel, so it "
+                        "may already have filled", symbol, order_id)
+            return None
+
+        client_order_id = new_client_order_id(symbol)
+        args = [
+            "order", "submit",
+            "--symbol", symbol,
+            "--qty", str(quantity),
+            "--side", "buy",
+            "--type", "limit",
+            "--limit-price", f"{limit_price:.2f}",
+            "--time-in-force", "day",
+            "--position-intent", "buy_to_open",
+            "--client-order-id", client_order_id,
+        ]
+        if self._dry_run:
+            args.append("--dry-run")
+
+        payload = self._call(*args)
+        return self._receipt(payload, client_order_id, symbol, quantity, limit_price)
+
     def open_orders(self) -> list[dict]:
         """Orders that have not yet filled or been cancelled."""
         return self._order_rows("open")
@@ -335,7 +383,7 @@ class CliExecutor:
             str(order.get("symbol", ""))
             for order in self._order_rows("closed", limit=limit)
             if str(order.get("side", "")).lower() == "buy"
-            and _filled_quantity(order) > 0
+            and filled_quantity(order) > 0
         }
 
     def _order_rows(self, status: str, *, limit: int | None = None) -> list[dict]:

@@ -34,8 +34,8 @@ from datetime import UTC, date, datetime, time
 from zoneinfo import ZoneInfo
 
 from agent.domain import MarketBrief, OpenPosition, Proposal
-from agent.entry import decide_entry
-from agent.executor import CliExecutor, ExecutionError
+from agent.entry import decide_entry, limit_from_quote
+from agent.executor import CliExecutor, ExecutionError, filled_quantity
 from agent.exits import (
     ExitDecision,
     ExitReason,
@@ -63,6 +63,8 @@ class PassResult:
     ordered: int = 0      # sent to the broker this pass
     opened: int = 0       # confirmed filled this pass, whenever they were ordered
     closed: int = 0
+    repriced: int = 0     # resting entry limits moved up to a fresh quote
+    abandoned: int = 0    # resting entry orders given up on and cancelled
     skipped_before_model: int = 0
     refusals: list[tuple[str, str]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -458,6 +460,14 @@ async def run_pass(
         logger.warning(message)
         notifier.alert(message)
 
+    # Resting entry orders: re-priced against a fresh quote, or given up on.
+    # Deliberately before `pending` is read, so an order abandoned here frees its
+    # slot for this pass rather than the next one -- the slot was the thing it
+    # was costing.
+    result.repriced, result.abandoned = await _refresh_resting_entries(
+        reader, executor, journal, notifier, settings,
+        now=datetime.now(UTC), halted=trading_halted)
+
     # Orders resting at the broker that have not filled. On a data feed where a
     # limit can sit unexecuted for hours, this is not an edge case -- it is the
     # normal state between placing an order and owning a position, and the gates
@@ -831,6 +841,229 @@ def _pending_underlyings(executor: CliExecutor) -> frozenset[str]:
             # reason about, but not a reason to fail either.
             continue
     return frozenset(found)
+
+
+def _order_float(order: dict, *keys: str) -> float | None:
+    """A numeric field off an order row, or None if it cannot be read.
+
+    The CLI returns these as strings, omits some entirely, and sends None for
+    others. None is kept distinct from zero on purpose: a price that could not
+    be read must not quietly become a price of nothing.
+    """
+    for key in keys:
+        raw = order.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _order_age_minutes(order: dict, now: datetime) -> float | None:
+    """How long an order has been resting, or None if its timestamp is unreadable.
+
+    None means do nothing. Every rule that reads this is a timeout, and a
+    timeout measured from a timestamp that could not be parsed would fire at an
+    arbitrary moment -- including instantly, on an order placed seconds ago.
+    """
+    for key in ("submitted_at", "created_at", "submittedAt", "createdAt"):
+        raw = order.get(key)
+        if not raw:
+            continue
+        text = str(raw).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        # Alpaca sends nanoseconds. `fromisoformat` accepts at most microseconds,
+        # so the fraction is truncated rather than handed over whole.
+        if "." in text:
+            head, _, tail = text.partition(".")
+            digits = ""
+            for char in tail:
+                if not char.isdigit():
+                    break
+                digits += char
+            suffix = tail[len(digits):]
+            text = f"{head}.{digits[:6]}{suffix}" if digits else head + suffix
+        try:
+            stamp = datetime.fromisoformat(text)
+        except ValueError:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=UTC)
+        return (now - stamp).total_seconds() / 60.0
+    return None
+
+
+def _abandon_entry_order(executor: CliExecutor, journal: Journal,
+                         notifier: Notifier, underlying: str, symbol: str,
+                         order_id: str, why: str) -> bool:
+    """Cancel a resting entry order and say so. False if it would not cancel.
+
+    The `holdings` row is deliberately left behind. `_reconcile_holdings`
+    already decides what a row with no position means, and it decides it by
+    asking the broker whether that contract ever filled -- the one question that
+    separates "this never happened" from "this filled and then left the book",
+    and the exact race a cancel can lose. A second copy of that decision here
+    would be a worse one.
+    """
+    if not executor.cancel(order_id):
+        return False
+
+    journal.record("abandoned", underlying, symbol,
+                   f"gave up on the entry order -- {why}")
+    message = f"{symbol} entry order cancelled unfilled: {why}"
+    logger.info(message)
+    notifier.alert(message)
+    return True
+
+
+async def _refresh_resting_entries(reader, executor: CliExecutor, journal: Journal,
+                                   notifier: Notifier, settings: Settings,
+                                   *, now: datetime,
+                                   halted: bool) -> tuple[int, int]:
+    """Move stale entry limits up to a fresh quote, and abandon hopeless ones.
+
+    An entry goes out as a day limit priced at the quoted ask, and until this
+    existed nothing ever looked at it again. On this feed that is not an edge
+    case: on 5 Nov 2026 an IWM put ordered at 17:20 was still resting unfilled
+    two hours later, holding a position slot and about $5,356 of buying power
+    against a price the market had left behind.
+
+    **The problem is staleness, not timidity.** Bidding higher has already been
+    tried -- it is what took `entry_aggression` from 0.6 to 1.0 after four
+    orders sat unfilled on 31 Aug 2026 -- and it cannot fix this, because at 1.0
+    the limit was AT the ask when it was placed. What is wrong an hour later is
+    the quote it came from. So this re-reads the quote and re-prices at the same
+    aggression as any other entry; it never names a number above the ask.
+
+    Three outcomes, and the order of the checks is the design:
+
+      **Too young** -- left alone. Most marketable limits fill on the spot, and
+      cancelling to re-place surrenders queue position for nothing.
+
+      **Too old** -- abandoned, re-priced or not. An order unfilled after
+      `entry_order_max_age_minutes` is not waiting for a price, it is holding a
+      slot shut.
+
+      **Chased too far** -- abandoned. Every gate that approved this trade
+      priced it at the original limit, so a fill materially above it is not the
+      trade that was authorised. The name can be proposed again from scratch at
+      whatever it now costs, which is a decision for the gates and not for this.
+
+    An entry NEVER escalates to market, which is the deliberate asymmetry
+    against `_close`. A missed exit keeps losing money while it sits; a missed
+    entry costs only an opportunity that returns in fifteen minutes, and paying
+    an unbounded price to win a race that does not matter is how this feed's
+    ten-percent-wide quotes get crossed for real.
+
+    Returns (re-priced, abandoned), for the pass summary.
+    """
+    from agent.market import parse_occ_symbol
+
+    try:
+        orders = executor.open_orders()
+    except ExecutionError as exc:
+        # Nothing is cancelled or re-priced on a failed read. A resting order
+        # left alone for one pass costs fifteen minutes; acting on a partial
+        # view of the book costs money.
+        logger.warning("could not read resting entry orders: %s", exc)
+        return 0, 0
+
+    repriced = abandoned = 0
+    for order in orders:
+        if str(order.get("side", "")).lower() != "buy":
+            continue
+
+        symbol = str(order.get("symbol", ""))
+        order_id = str(order.get("id", ""))
+        if not symbol or not order_id:
+            continue
+        try:
+            underlying = parse_occ_symbol(symbol).underlying
+        except ValueError:
+            # Not an option order -- something else placed it. Not ours to
+            # re-price, and not a reason to fail either.
+            continue
+
+        # A partial fill means the position already exists and its holdings row
+        # is live. Re-pricing the remainder would change the size the gates
+        # approved, so the remainder is left to fill or expire on its own.
+        if filled_quantity(order) > 0:
+            continue
+
+        age = _order_age_minutes(order, now)
+        if age is None or age < settings.entry_reprice_after_minutes:
+            continue
+
+        if age >= settings.entry_order_max_age_minutes:
+            if _abandon_entry_order(executor, journal, notifier, underlying,
+                                    symbol, order_id,
+                                    f"still unfilled after {age:.0f} minutes"):
+                abandoned += 1
+            continue
+
+        if halted:
+            # The kill switch is on. Letting an order expire is one thing;
+            # moving its price up is committing new money to a new position
+            # while new positions are forbidden. The age check above still runs,
+            # because freeing a stuck slot is not opening anything.
+            continue
+
+        resting = _order_float(order, "limit_price", "limitPrice")
+        quantity = _order_float(order, "qty", "quantity")
+        if resting is None or resting <= 0 or not quantity or quantity <= 0:
+            continue
+
+        # What the trade was actually authorised at. `open_holding` writes the
+        # submitted limit into `entry_premium`, and `correct_entry_premium` only
+        # overwrites it once a fill exists -- so for an unfilled order that row
+        # still holds the ORIGINAL price, however many re-prices it has had.
+        # That is what keeps the chase ceiling a total rather than a per-step
+        # allowance that could walk the price up indefinitely.
+        holding = journal.holding(symbol)
+        anchor = (holding.entry_premium
+                  if holding is not None and holding.entry_premium > 0
+                  else resting)
+
+        quote = await reader.option_quote(symbol)
+        if quote is None:
+            continue
+        bid, ask = quote
+        if ask <= 0 or ask < bid:
+            continue
+        fresh = limit_from_quote(bid, ask, settings.entry_aggression)
+
+        # Half a cent of slack, because a limit can only express whole cents.
+        # Nothing is cancelled to re-place at a price the market has not moved
+        # past: a quote that has FALLEN is a reason to wait, not to lower the bid
+        # on a trade the gates approved at a higher one.
+        if fresh <= resting + 0.005:
+            continue
+
+        ceiling = anchor * (1 + settings.entry_reprice_max_chase_pct)
+        if fresh > ceiling:
+            if _abandon_entry_order(
+                    executor, journal, notifier, underlying, symbol, order_id,
+                    f"the quote has moved to {fresh:.2f}, more than "
+                    f"{settings.entry_reprice_max_chase_pct:.0%} above the "
+                    f"{anchor:.2f} the gates approved"):
+                abandoned += 1
+            continue
+
+        receipt = executor.reprice_buy_limit(symbol, int(quantity), fresh, order_id)
+        if receipt is None:
+            continue
+
+        detail = (f"re-priced {resting:.2f} -> {fresh:.2f} after {age:.0f} "
+                  f"minutes unfilled; approved at {anchor:.2f} "
+                  f"[{receipt.client_order_id}]")
+        journal.record("repriced", underlying, symbol, detail)
+        logger.info("%s %s", symbol, detail)
+        repriced += 1
+
+    return repriced, abandoned
 
 
 def _with_new_position(ctx: GateContext, draft) -> GateContext:

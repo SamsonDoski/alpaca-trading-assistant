@@ -87,6 +87,18 @@ def pick_contract(candidates: list[OptionContract] | tuple[OptionContract, ...],
     return min(usable, key=rank)
 
 
+def limit_from_quote(bid: float, ask: float, aggression: float) -> float:
+    """Where to place the limit inside a spread, from raw bid and ask.
+
+    Split out from `limit_price` so that re-pricing a resting order and placing
+    a fresh one cannot drift apart. The re-price path has only a quote in hand,
+    never a contract -- the contract it was chosen from belongs to a brief built
+    an hour ago -- and two copies of this arithmetic is exactly the kind of
+    difference that would be invisible until a fill came in at the wrong price.
+    """
+    return round(bid + (ask - bid) * aggression, 2)
+
+
 def limit_price(contract: OptionContract, aggression: float) -> float:
     """Where to place the limit inside the spread.
 
@@ -99,8 +111,7 @@ def limit_price(contract: OptionContract, aggression: float) -> float:
     Rounded to the cent, because that is the smallest increment an option order
     can actually express.
     """
-    span = contract.ask - contract.bid
-    return round(contract.bid + span * aggression, 2)
+    return limit_from_quote(contract.bid, contract.ask, aggression)
 
 
 def decide_entry(proposal: Proposal, brief: MarketBrief, ctx: GateContext) -> GateOutcome:

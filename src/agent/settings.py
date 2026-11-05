@@ -258,6 +258,47 @@ class Settings:
     # rule into 1.6:1 and lifting the break-even win rate from 33% to about 38%.
     exit_aggression: float = 1.0
 
+    # --- When an entry order does not fill ----------------------------------
+    # An entry is a DAY limit, so one that does not fill rests until the close
+    # and nothing used to refresh it. On this feed that is not an edge case. On
+    # 5 Nov 2026 an IWM put ordered at 17:20 was still resting unfilled two hours
+    # later, holding a position slot and about $5,356 of buying power against a
+    # price the market had long since left behind.
+    #
+    # **Bidding higher is not the fix, and has already been tried.** That is what
+    # took `entry_aggression` from 0.6 to 1.0 on 31 Aug 2026, after four orders
+    # sat at `status: new` with filled_qty 0 for thirty minutes. It helped and it
+    # did not solve this, because the problem is not that the limit was too timid
+    # when it was placed -- at 1.0 it was AT the quoted ask -- but that the quote
+    # it was derived from is minutes old and the ask has moved. The answer is to
+    # re-read the quote, not to name a number above it.
+    #
+    # So an order older than this is re-priced from a fresh quote, at the same
+    # `entry_aggression` as any other entry. Younger than this it is left alone:
+    # most fills arrive on the spot, and cancelling to re-place surrenders queue
+    # position for nothing. Two passes at the fifteen-minute schedule.
+    entry_reprice_after_minutes: int = 30
+
+    # How far above the ORIGINAL limit this will chase, in total across every
+    # re-price. Every gate that approved the trade priced it at that premium --
+    # the sizing, the spread ranking, the richness ceiling and the decay ceiling
+    # are all fractions of it -- so a fill materially above it is not the trade
+    # that was authorised, however good the thesis still looks. Past this the
+    # order is abandoned rather than re-priced, and the name is free to be
+    # proposed again from scratch at whatever it now costs.
+    entry_reprice_max_chase_pct: float = 0.05
+
+    # Give up outright at this age, re-priced or not. An order still unfilled
+    # after ninety minutes is not waiting for a price, it is holding a slot shut.
+    # Abandoning frees the slot and the buying power in the same pass.
+    #
+    # Note what is deliberately absent: an entry NEVER escalates to market. That
+    # asymmetry against the exit path is the whole point. A missed exit keeps
+    # losing money while it sits, which is why `close_at_market` exists; a missed
+    # entry costs only an opportunity that returns in fifteen minutes. Paying an
+    # unbounded price to win a race that does not matter is how this feed's
+    # 10%-wide quotes would get crossed for real.
+    entry_order_max_age_minutes: int = 90
 
     @property
     def take_profit_pct(self) -> float:

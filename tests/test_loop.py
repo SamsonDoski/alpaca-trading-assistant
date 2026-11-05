@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -1672,3 +1672,249 @@ def test_an_externally_closed_position_is_not_mistaken_for_our_own_sale(journal)
 
     assert "alert" in notifier.calls
     assert journal.cooling_off(within_days=2)["F"] == 2
+
+
+# --- Resting entry orders: re-priced, or given up on ----------------------
+#
+# This exists because of a measured cost rather than a theory. An IWM put
+# ordered at 17:20 on 5 Nov 2026 was still resting unfilled two hours later,
+# holding a position slot and about $5,356 of buying power against a price the
+# market had left behind.
+#
+# Half of these tests assert that it does NOTHING. An entry order is real money
+# and queue position is worth something, so a loop that cancelled and re-placed
+# on every pass would be worse than the problem it fixes.
+
+RESTING = "IWM261218P00283000"
+
+# The live config places entries at the quoted ask; the dataclass default is
+# 0.6. Pinning it here means these prices are the ones production would name.
+AT_THE_ASK = SETTINGS.with_overrides(entry_aggression=1.0)
+
+NOW = datetime(2026, 11, 5, 19, 0, tzinfo=UTC)
+
+
+def _entry_order(*, minutes_old=45.0, limit=13.39, qty=4, filled=0,
+                 side="buy", symbol=RESTING):
+    """One row shaped the way the CLI's order list actually shapes them.
+
+    Numbers arrive as strings and the timestamp carries nanoseconds and a `Z`,
+    which is precisely the shape `datetime.fromisoformat` will not accept
+    unaided -- so the parser is exercised rather than flattered.
+    """
+    stamp = NOW - timedelta(minutes=minutes_old)
+    return {
+        "id": f"order-{symbol}",
+        "symbol": symbol,
+        "side": side,
+        "qty": str(qty),
+        "filled_qty": str(filled),
+        "limit_price": f"{limit:.2f}",
+        "submitted_at": stamp.strftime("%Y-%m-%dT%H:%M:%S.123456789") + "Z",
+    }
+
+
+class RestingEntryExecutor:
+    """Enough of CliExecutor to exercise the re-price path and nothing else."""
+
+    def __init__(self, orders, *, cancel_ok=True, fail_read=False):
+        self._orders = list(orders)
+        self._cancel_ok = cancel_ok
+        self._fail_read = fail_read
+        self.cancelled: list[str] = []
+        self.repriced: list[tuple[str, int, float]] = []
+
+    def open_orders(self):
+        if self._fail_read:
+            raise ExecutionError("broker unreachable")
+        return list(self._orders)
+
+    def cancel(self, order_id):
+        self.cancelled.append(order_id)
+        return self._cancel_ok
+
+    def reprice_buy_limit(self, symbol, quantity, limit_price, order_id):
+        # Mirrors the real method's contract, including the part that matters:
+        # if the cancel fails, nothing is submitted.
+        if not self.cancel(order_id):
+            return None
+        self.repriced.append((symbol, quantity, limit_price))
+        return OrderReceipt("ata-reprice", symbol, quantity, limit_price,
+                            status="accepted", dry_run=True)
+
+    def close_at_market(self, position):
+        raise AssertionError("an entry must never escalate to market")
+
+
+class QuoteReader:
+    def __init__(self, quote):
+        self._quote = quote
+
+    async def option_quote(self, occ_symbol):
+        return self._quote
+
+
+def refresh(journal, executor, quote, *, halted=False, settings=AT_THE_ASK):
+    from agent.loop import _refresh_resting_entries
+    return asyncio.run(_refresh_resting_entries(
+        QuoteReader(quote), executor, journal, RecordingNotifier(), settings,
+        now=NOW, halted=halted))
+
+
+def test_a_fresh_entry_order_is_left_to_fill(journal):
+    """Most marketable limits fill on the spot. Cancelling to re-place inside
+    the first half hour surrenders queue position for nothing."""
+    executor = RestingEntryExecutor([_entry_order(minutes_old=10)])
+
+    assert refresh(journal, executor, (13.50, 13.70)) == (0, 0)
+    assert executor.cancelled == []
+
+
+def test_a_stale_entry_order_is_repriced_to_the_current_ask(journal):
+    """The order was at the ask when it was placed. What is wrong forty-five
+    minutes later is the quote it was derived from, not the aggression."""
+    executor = RestingEntryExecutor([_entry_order(minutes_old=45, limit=13.39)])
+
+    assert refresh(journal, executor, (13.50, 13.70)) == (1, 0)
+    assert executor.repriced == [(RESTING, 4, 13.70)]
+
+
+def test_an_order_is_not_re_placed_at_a_price_the_market_has_not_passed(journal):
+    """A quote that has FALLEN is a reason to wait, not to lower the bid on a
+    trade the gates approved at a higher one."""
+    executor = RestingEntryExecutor([_entry_order(minutes_old=45, limit=13.39)])
+
+    assert refresh(journal, executor, (12.90, 13.10)) == (0, 0)
+    assert executor.cancelled == []
+
+
+def test_an_order_unfilled_for_too_long_is_abandoned(journal):
+    """Not waiting for a price any more -- holding a slot shut. Freeing it is
+    the point, so nothing is re-placed."""
+    executor = RestingEntryExecutor([_entry_order(minutes_old=130)])
+
+    assert refresh(journal, executor, (13.50, 13.70)) == (0, 1)
+    assert executor.cancelled == [f"order-{RESTING}"]
+    assert executor.repriced == []
+
+
+def test_a_quote_that_ran_away_is_abandoned_rather_than_chased(journal):
+    """Sizing, the spread ranking and both price ceilings were all computed at
+    the original limit, so a fill well above it is not the authorised trade."""
+    executor = RestingEntryExecutor([_entry_order(minutes_old=45, limit=13.39)])
+
+    assert refresh(journal, executor, (14.80, 15.00)) == (0, 1)
+    assert executor.repriced == []
+
+
+def test_the_chase_ceiling_is_measured_from_the_original_limit(journal):
+    """Otherwise every re-price would reset the allowance, and the agent would
+    walk the price up five percent at a time without limit.
+
+    13.95 is already one step above the 13.39 the gates approved. A further
+    step to 14.30 is inside 5% of 13.95 and outside 5% of 13.39, and 13.39 is
+    the number that counts -- it is what the unfilled holdings row still holds.
+    """
+    journal.open_holding(occ_symbol=RESTING, underlying="IWM", direction="down",
+                         entry_spot=283.0, entry_premium=13.39,
+                         stop_spot=289.0, target_spot=271.0)
+    executor = RestingEntryExecutor([_entry_order(minutes_old=45, limit=13.95)])
+
+    assert refresh(journal, executor, (14.10, 14.30)) == (0, 1)
+    assert executor.repriced == []
+
+
+def test_a_partly_filled_order_is_left_alone(journal):
+    """The position already exists, at the size the gates approved. Re-pricing
+    the remainder would quietly change that size."""
+    executor = RestingEntryExecutor([_entry_order(minutes_old=45, qty=4, filled=2)])
+
+    assert refresh(journal, executor, (13.50, 13.70)) == (0, 0)
+    assert executor.cancelled == []
+
+
+def test_an_unreadable_timestamp_never_starts_a_timeout(journal):
+    """Every rule here is a timeout. One measured from a timestamp that could
+    not be parsed would fire at an arbitrary moment -- including instantly, on
+    an order placed seconds ago."""
+    order = _entry_order(minutes_old=200)
+    order["submitted_at"] = "whenever"
+    executor = RestingEntryExecutor([order])
+
+    assert refresh(journal, executor, (13.50, 13.70)) == (0, 0)
+    assert executor.cancelled == []
+
+
+def test_an_order_that_will_not_cancel_is_not_re_placed(journal):
+    """A cancel fails mainly because the order has just filled, and that is the
+    one race in which submitting anyway buys the position twice."""
+    executor = RestingEntryExecutor([_entry_order(minutes_old=45)], cancel_ok=False)
+
+    assert refresh(journal, executor, (13.50, 13.70)) == (0, 0)
+    assert executor.repriced == []
+
+
+def test_an_unreadable_order_book_changes_nothing(journal):
+    """A resting order left alone for one pass costs fifteen minutes. Acting on
+    a partial view of the book costs money."""
+    executor = RestingEntryExecutor([], fail_read=True)
+
+    assert refresh(journal, executor, (13.50, 13.70)) == (0, 0)
+    assert executor.cancelled == []
+
+
+def test_the_kill_switch_stops_re_pricing_but_still_frees_a_stuck_slot(journal):
+    """Moving a limit up commits new money to a new position, which is the
+    thing the switch forbids. Cancelling a dead order opens nothing."""
+    stale = RestingEntryExecutor([_entry_order(minutes_old=45)])
+    assert refresh(journal, stale, (13.50, 13.70), halted=True) == (0, 0)
+    assert stale.cancelled == []
+
+    ancient = RestingEntryExecutor([_entry_order(minutes_old=130)])
+    assert refresh(journal, ancient, (13.50, 13.70), halted=True) == (0, 1)
+
+
+def test_a_resting_exit_order_is_not_an_entry_to_re_price(journal):
+    """The exit path has its own escalation and is allowed to reach market.
+    Nothing here may touch a sell."""
+    executor = RestingEntryExecutor([_entry_order(minutes_old=130, side="sell")])
+
+    assert refresh(journal, executor, (13.50, 13.70)) == (0, 0)
+    assert executor.cancelled == []
+
+
+def test_a_non_option_order_is_left_to_whatever_placed_it(journal):
+    """This account may hold things the agent did not buy."""
+    executor = RestingEntryExecutor([_entry_order(minutes_old=130, symbol="AAPL")])
+
+    assert refresh(journal, executor, (13.50, 13.70)) == (0, 0)
+    assert executor.cancelled == []
+
+
+def test_both_outcomes_are_written_down(journal):
+    """A re-price and an abandonment are both decisions about money, and
+    neither is visible in the positions list afterwards."""
+    moved = RestingEntryExecutor([_entry_order(minutes_old=45, limit=13.39)])
+    refresh(journal, moved, (13.50, 13.70))
+    gone = RestingEntryExecutor([_entry_order(minutes_old=130)])
+    refresh(journal, gone, (13.50, 13.70))
+
+    actions = [event.action for event in journal.recent(limit=10)]
+    assert "repriced" in actions
+    assert "abandoned" in actions
+
+
+def test_an_abandoned_order_keeps_its_holdings_row(journal):
+    """`_reconcile_holdings` decides what a row with no position means, and it
+    decides it by asking the broker whether the contract ever filled -- the one
+    question that separates "never happened" from "filled and left the book",
+    and the exact race a cancel can lose. Clearing the row here would be a
+    second, worse copy of that decision.
+    """
+    journal.open_holding(occ_symbol=RESTING, underlying="IWM", direction="down",
+                         entry_spot=283.0, entry_premium=13.39,
+                         stop_spot=289.0, target_spot=271.0)
+    executor = RestingEntryExecutor([_entry_order(minutes_old=130)])
+
+    assert refresh(journal, executor, (13.50, 13.70)) == (0, 1)
+    assert journal.holding(RESTING) is not None
