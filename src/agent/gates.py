@@ -234,13 +234,14 @@ class SectorConcentration:
 
 @dataclass(frozen=True, slots=True)
 class Cooldown:
-    """Blocks re-entry into a name that recently stopped out.
+    """Blocks re-entry into a name the agent closed recently.
 
-    Applied after a stop loss and never after a win, because a win means the
-    reasoning worked and there is nothing to cool off from. This exists because
-    of an observed live failure, not a backtest: the earlier system re-bought a
-    name minutes after being stopped out of it, on the same signal that had just
-    failed.
+    Applied after any close, win or loss. Both halves exist because of observed
+    live failures rather than a backtest. The earlier system re-bought a name
+    minutes after being stopped out of it, on the same signal that had just
+    failed. And on 5 Nov 2026 it sold three winners and bought all three
+    straight back, giving up most of the day's gains -- see
+    `Journal.cooling_off`, which decides what counts.
     """
 
     name: str = "cooldown"
@@ -249,7 +250,7 @@ class Cooldown:
         remaining = ctx.cooling_off.get(underlying, 0)
         if remaining > 0:
             return Verdict.deny(
-                f"stopped out recently -- {remaining} day(s) of cooldown left")
+                f"traded recently -- {remaining} session(s) of cooldown left")
         return Verdict.allow()
 
 

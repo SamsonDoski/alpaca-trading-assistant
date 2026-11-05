@@ -531,25 +531,51 @@ class Journal:
         last -- decision rows accumulate as the day goes on, and a cooldown that
         quietly expired at lunchtime would be worse than no cooldown at all.
 
-        **Any losing close counts, whatever reason it carries.** A take-profit
-        does not: the reasoning worked, and re-entering after a win is not the
-        behaviour this rule exists to prevent.
+        **Every close counts, win or loss, whatever reason it carries.**
 
-        That used to be narrower. Only a stop loss started a cooldown, on the
-        argument that a premium backstop means the option collapsed while the
-        thesis survived -- nothing disproved, nothing to cool off from. On
-        9 Oct 2026 both accounts closed a GLD put at about -26% under that label
-        and bought a GLD CALL on the same name within forty minutes.
+        This rule has been widened twice, and both times the same assumption was
+        wrong: that the re-entry worth preventing is the one repeating a trade
+        that failed.
 
-        The argument had assumed the only re-entry worth preventing was the same
-        trade again. Taking the opposite side of a name that just cost a full
-        position is worse, and it refutes its own premise: if the bearish view
-        was still alive, the bullish one cannot be. The money is gone either
-        way, which is the fact the rule should key on.
+        It first keyed on the stop-loss label alone, on the argument that a
+        premium backstop means the option collapsed while the thesis survived --
+        nothing disproved, nothing to cool off from. On 9 Oct 2026 both accounts
+        closed a GLD put at about -26% under that label and bought a GLD CALL on
+        the same name within forty minutes. Taking the opposite side of a name
+        that just cost a full position refutes its own premise: if the bearish
+        view was still alive, the bullish one cannot be.
 
-        The label still means what it meant -- a failed thesis reads differently
-        from a broken quote in the journal, and that is worth keeping. It just
-        no longer decides this.
+        It then keyed on money lost, exempting wins because the thesis had
+        worked. Replayed across 81 and 76 entries on the two accounts, 3 Sep to
+        5 Nov 2026, that exemption let through 20 re-entries into a name the
+        agent had just won on. Four of them made money:
+
+            after a win of       n   won       net
+            over $2,000          9     1   -10,475
+            under $2,000        11     3    -1,756
+
+        Taking profit does not mean the move is still available. It usually means
+        most of it has already happened, and the agent buys the same idea back at
+        a worse strike having paid the spread twice. The damage concentrates after
+        the BIGGEST wins, which is what that split says: one winner in nine.
+
+        Observed directly on 5 Nov 2026, three times in ninety minutes. V sold
+        +3,450 and re-bought for -1,600; XLV sold +3,720 and re-bought for
+        -1,925; KO sold +357 and re-bought five minutes later. +7,527 banked
+        before lunch became +1,873 realised.
+
+        Two honest limits on that number. It is gross, not net: a refused entry
+        frees a slot and about a position's worth of capital, and there is no way
+        to know what the next pass would have done with it. And the sample is 20.
+        What makes it actionable anyway is that the sign is the same on both
+        accounts independently (-5,595 and -6,636), and that the gains given up
+        are IDENTICAL at every window tested -- all four winning re-entries came
+        within one session -- so a longer cooldown only ever catches more losers.
+        Nothing here needed a second number to be chosen.
+
+        The reason label still means what it meant: a failed thesis reads
+        differently from a broken quote, and that is worth keeping in the
+        journal. It just no longer decides anything here.
         """
         today = as_of or datetime.now(UTC).date()
         # Bounded so this does not scan the whole history. Generous, because the
@@ -558,15 +584,15 @@ class Journal:
         floor = (today - timedelta(days=max(30, within_days * 10))).isoformat()
 
         with self._connect() as conn:
-            # A loss is a loss: `pnl < 0` covers stops, premium backstops and
-            # anything else that closed down. Positions closed outside the agent
-            # carry no P&L to judge, so those are matched by name.
+            # Nothing is filtered but the date. A win, a loss, and a position
+            # closed outside the agent -- which carries no P&L to judge at all
+            # -- are the same fact here: this name was traded, and it is too
+            # soon to trade it again.
             rows = conn.execute(
                 "SELECT underlying, MAX(day) AS day FROM events "
                 "WHERE action = 'closed' AND day >= ? "
-                "AND (pnl < 0 OR detail LIKE ?) "
                 "GROUP BY underlying",
-                (floor, f"{_EXTERNAL_PREFIX}%"),
+                (floor,),
             ).fetchall()
 
             remaining: dict[str, int] = {}
@@ -667,8 +693,8 @@ class Journal:
                 "total_pnl": float(row["total_pnl"])}
 
 
-# `cooling_off` no longer matches on the words in a close at all -- it keys on
-# money lost, so every losing close counts and no wording can exempt one.
+# `cooling_off` reads neither the words in a close nor its P&L -- every close
+# arms a cooldown, so neither a wording nor a profit can exempt one.
 # `loop.py` still writes "stop loss" or "premium backstop", because a failed
 # thesis and a broken quote read differently in the journal and that is worth
 # keeping. It just no longer decides anything.

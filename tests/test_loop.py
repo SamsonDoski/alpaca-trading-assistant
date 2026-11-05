@@ -119,12 +119,35 @@ def test_a_stop_loss_close_starts_a_cooldown(journal):
     assert cooling["AAPL"] == 2
 
 
-def test_a_take_profit_close_starts_no_cooldown(journal):
-    """A win means the reasoning worked, and re-entering after a win is not the
-    behaviour the cooldown exists to prevent."""
+def test_a_winning_close_also_starts_a_cooldown(journal):
+    """This used to assert the opposite, and the opposite was wrong.
+
+    Replayed across both accounts from 3 Sep to 5 Nov 2026, exempting wins let
+    through 20 re-entries into a name the agent had just won on; four made
+    money, for a net -12,231. Taking profit does not mean the move is still
+    available -- it usually means most of it has happened.
+    """
     journal.record("closed", "AAPL", "AAPL261016C00310000",
                    "take profit — up 51%", pnl=800)
-    assert journal.cooling_off(within_days=2) == {}
+    assert journal.cooling_off(within_days=2)["AAPL"] == 2
+
+
+def test_a_close_with_no_pnl_recorded_starts_a_cooldown(journal):
+    """Nothing is filtered but the date, so a close the agent could not price
+    cannot slip through on a missing number. It used to need the "closed outside
+    the agent" prefix to count; now being a close is enough.
+    """
+    journal.record("closed", "F", "F261016P00015000", "left the book somehow")
+    assert journal.cooling_off(within_days=2)["F"] == 2
+
+
+def test_a_win_and_a_loss_cool_off_for_the_same_length(journal):
+    """Widening what ARMS the cooldown must not change how it expires -- that
+    part is measured in trading sessions and was already right.
+    """
+    journal.record("closed", "AAPL", "AAPL261016C00310000", "take profit", pnl=800)
+    journal.record("closed", "MSFT", "MSFT261016C00500000", "stop loss", pnl=-400)
+    assert journal.cooling_off(within_days=2) == {"AAPL": 2, "MSFT": 2}
 
 
 def _utc_today() -> date:
@@ -894,8 +917,9 @@ def test_a_trailing_stop_is_urgent():
 
 
 def test_a_trailing_stop_is_not_labelled_a_stop_loss():
-    """`cooling_off` keys on realised P&L, but the label is what a human reads
-    in the journal, and most of these closes are wins."""
+    """`cooling_off` reads neither the label nor the P&L any more, but the label
+    is still what a human reads in the journal, and most of these closes are
+    wins rather than stops."""
     from agent.loop import _detail_prefix
     decision = check_exit(position(entry=10.00, current=11.20), SETTINGS, TODAY,
                           holding=_trailed(peak=14.00), spot=313.0)
@@ -1039,11 +1063,13 @@ def test_banking_a_gain_is_patient_not_urgent():
     assert not check_exit(held, SETTINGS, TODAY, holding=holding, spot=167.88).urgent
 
 
-def test_banking_a_gain_starts_no_cooldown(journal):
-    """A win means the reasoning worked. Nothing to cool off from."""
+def test_banking_a_gain_starts_a_cooldown_too(journal):
+    """Also once asserted the opposite. A take profit says the move happened,
+    not that there is more of it to buy -- and the replay says re-entering on
+    one is where the money went. See `Journal.cooling_off`."""
     journal.record("closed", "PLTR", "PLTR261016P00200000",
                    "premium target -- premium up 50.7%", pnl=1105)
-    assert journal.cooling_off(within_days=2) == {}
+    assert journal.cooling_off(within_days=2)["PLTR"] == 2
 
 
 def test_the_underlying_target_still_wins_when_both_are_reached():

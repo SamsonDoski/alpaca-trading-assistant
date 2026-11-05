@@ -799,15 +799,15 @@ async def _close(decision: ExitDecision, reader, executor: CliExecutor,
 
 
 def _detail_prefix(decision: ExitDecision) -> str:
-    """The first words of a close, which the cooldown rule reads back.
+    """The first words of a close, for the journal and for Discord.
 
-    A stop-loss close must begin with exactly the string `journal.cooling_off`
-    matches on, because that is what distinguishes "this thesis failed" from
-    "this thesis worked and we banked it".
+    This decides nothing. `journal.cooling_off` once matched on these words,
+    then on the P&L, and now arms a cooldown on every close regardless -- so the
+    prefix is a label for a human reading the log, not an input to a rule.
 
-    A premium backstop deliberately does NOT get that prefix, and so starts no
-    cooldown. It fires when the option collapsed while the underlying thesis
-    held -- nothing was disproved, so there is nothing to cool off from.
+    It is still worth getting right: a stop loss, a premium backstop and a
+    trailing stop are three different stories about why a trade ended, and a
+    report that conflates them cannot be used to judge the exit rules.
     """
     return "stop loss" if decision.reason is ExitReason.STOP_LOSS else decision.reason.value
 
